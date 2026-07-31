@@ -2,7 +2,8 @@
 
 ## State            (rewrite in place — current truth only, ≤ ~10 lines)
 - `python/` is complete: 251 tests green, ruff + `mypy --strict` clean, uv-managed. No other language port.
-- PR #1 open against main; code review applied (2 silent-corruption fixes + read-path tuning).
+- PR #1 squash-merged to main as `e7a4c91`. PR #2 open on `claude/ci-workflow` (GitHub Actions).
+- Remote branch deletion returns 403 from this environment's git proxy — must be done in the GitHub UI.
 - CLAUDE.md now describes shipped code, not a plan. All five invariants are implemented.
 - Frame layer: polars core + thin pandas facade. Consumers are mostly pandas.
 - Claude assets ported from `RorySullivan1/claudeBrain` (`example-project/.claude/` is the source to copy from).
@@ -24,10 +25,12 @@
 - [2026-07-31] Write ordering rule is "the interruptible middle state must under-claim", not "manifest last": growing updates write data first, shrinking ones (`delete`) write the manifest first. — sessions/2026-07-31-2001-review-fixes.md
 - [2026-07-31] `DEFAULT_ROW_GROUP_SIZE = 64_000` — row groups are the parquet skip unit and every read is a time range, so finer groups buy ~1.35x on narrow reads for free. This is the read path's real lever. — sessions/2026-07-31-2001-review-fixes.md
 - [2026-07-31] Kept `concat + sort` over `merge_sorted` in `_merge`: measured faster in 5 of 6 shapes on polars 1.43 despite both inputs being sorted. Re-measure on a polars upgrade; don't swap on principle. — sessions/2026-07-31-2001-review-fixes.md
+- [2026-07-31] Mypy's `python_version` is deliberately unpinned: pinning it to the 3.11 floor makes 3.12/3.13 fail on numpy's own stubs. The 3.11 CI job guarantees the floor instead. Don't re-add the pin. — sessions/2026-07-31-2012-merge-and-ci.md
+- [2026-07-31] No `uv.lock` committed, so CI resolves fresh and an upstream release can turn it red with no local change. Intended for a template — early warning beats a lock that hides it. — sessions/2026-07-31-2012-merge-and-ci.md
 
 ## Threads          (open items; remove when closed)
 - Hooks invoke `python`, not `python3`; will silently no-op on a `python3`-only machine.
-- No CI workflow — the toolchain commands are documented but nothing runs them on push.
+- PR #2 (CI) not yet merged; drive it to green. Old branch `claude/timeseries-cache-template-pq0v1e` still needs deleting in the GitHub UI.
 - Interval algebra + cache semantics were fuzzed once by hand and came back clean; worth wiring in as property tests rather than a one-off.
 - No second language port; the backend protocol + manifest JSON are the intended seam.
 - Accepted (not bugs): single-writer per key, whole-key rewrite per write, schema fixed per key.
@@ -35,3 +38,5 @@
 ## Log              (append-only pointers)
 - 2026-07-31 1841 | bootstrap CLAUDE.md + claudeBrain asset port | sessions/2026-07-31-1841-bootstrap-claude-md.md
 - 2026-07-31 1908 | Python implementation: coverage manifest, write modes, both facades | sessions/2026-07-31-1908-python-implementation.md
+- 2026-07-31 2001 | review fixes: key forgery, delete ordering, row-group tuning | sessions/2026-07-31-2001-review-fixes.md
+- 2026-07-31 2012 | merge PR #1 to main; CI workflow on PR #2 | sessions/2026-07-31-2012-merge-and-ci.md
