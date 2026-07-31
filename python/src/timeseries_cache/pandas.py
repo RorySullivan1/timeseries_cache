@@ -52,12 +52,26 @@ class PandasTimeseriesCache:
         backend: StorageBackend,
         *,
         timestamp_column: str = DEFAULT_TIMESTAMP_COLUMN,
+        identity_columns: Sequence[str] = (),
     ) -> None:
-        self._cache = TimeseriesCache(backend, timestamp_column=timestamp_column)
+        self._cache = TimeseriesCache(
+            backend,
+            timestamp_column=timestamp_column,
+            identity_columns=identity_columns,
+        )
 
     @property
     def timestamp_column(self) -> str:
         return self._cache.timestamp_column
+
+    @property
+    def identity_columns(self) -> tuple[str, ...]:
+        """Extra columns that, with the index, identify a row.
+
+        They stay ordinary columns on the pandas side — the index remains the
+        timestamp, and may legitimately repeat.
+        """
+        return self._cache.identity_columns
 
     @property
     def backend(self) -> StorageBackend:
@@ -83,8 +97,10 @@ class PandasTimeseriesCache:
 
         if isinstance(frame.index, pd.MultiIndex):
             raise IndexContractError(
-                "a MultiIndex has no single timestamp to key on; reset the "
-                "extra levels into columns or into cache kwargs"
+                "a MultiIndex has no single timestamp to key on. If the extra "
+                "levels identify rows that share a timestamp (trade ids, say), "
+                "reset them into columns and name them in identity_columns; "
+                "otherwise move them into cache kwargs"
             )
 
         if isinstance(frame.index, pd.DatetimeIndex):

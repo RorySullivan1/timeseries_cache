@@ -44,12 +44,28 @@ These are the reason the project exists. Everything else is negotiable.
 ### 1. Every cached object is datetime-indexed
 
 Storage is **polars**, so "indexed" means a designated timestamp column — by convention
-`ts` — that is tz-aware **UTC**, sorted ascending, and unique. Naive input is rejected
-at the boundary, never silently localized. This holds for every backend and every
-language port; code may assume it after validation and must enforce it before storing.
+`ts` — that is tz-aware **UTC** and sorted ascending. Naive input is rejected at the
+boundary, never silently localized. This holds for every backend and every language
+port; code may assume it after validation and must enforce it before storing.
 
 A pandas `DatetimeIndex` is a presentation concern, not a storage one — parquet stores a
 column either way. The pandas facade (below) sets and restores the index at the boundary.
+
+**Row identity is `(timestamp, *identity_columns)`.** By default `identity_columns` is
+empty and the timestamp alone identifies a row, so it must be unique. Supplying them —
+`identity_columns=("trade_id",)` — lets timestamps repeat, which is the real shape of
+trade data, and makes the composite the unit of uniqueness. `row_key` on the cache is
+that tuple; sorting, duplicate detection, and `upsert` matching all use it, never the
+timestamp alone. Identity columns may not be null, and are always projected on read
+even when not requested — rows the caller can't tell apart are useless.
+
+A key remembers the identity it was written with, and reading it under a different one
+raises. Two answers to "is this the same row" is how an `upsert` silently destroys
+rows it should have kept.
+
+**Coverage is time-based regardless.** Identity columns change what a *row* is; they
+never change what a *range* means. Window semantics — coverage, `replace_window`,
+`delete` — stay purely temporal.
 
 ### 2. Cache identity is the kwargs, and the kwargs are open-ended
 
@@ -87,8 +103,10 @@ requested range, so a caller's fetch loop asks upstream only for real gaps.
 Write modes, all taking an explicit target window rather than deriving one from the
 incoming data's min/max:
 
-- **`upsert`** (default) — incoming rows replace matching timestamps; existing rows
-  outside the incoming index survive.
+- **`upsert`** (default) — incoming rows replace those with a matching **row key**
+  (see invariant 1); existing rows outside the incoming set survive. With identity
+  columns configured, correcting one trade must not disturb its neighbours at the
+  same instant — which is why the anti-join is on `row_key`, not the timestamp.
 - **`replace_window`** — delete *everything* in `[start, end]`, then insert. The
   scalpel. Because the window is explicit, a corrected partial refetch can remove
   stale rows that the new data no longer contains — the case inference gets wrong.
@@ -208,6 +226,11 @@ tz-naive input, DST boundaries, and an interrupted write leaving the manifest
 consistent. Use the memory backend for logic, and exercise at least the round-trip
 against the real filesystem backend.
 
+Anything touching row identity needs both configurations — timestamp-only *and*
+identity columns — since the default path and the composite path take different
+branches in sorting, duplicate detection, and the upsert join. `tests/test_identity.py`
+holds the composite cases.
+
 Both facades must be tested against the same behavioral cases — parametrize over them
 rather than testing polars deeply and pandas shallowly. The pandas facade additionally
 needs: index round-trip (a frame written and read back is `assert_frame_equal` to the
@@ -247,6 +270,7 @@ can't recover from the code.
 
 On compaction, preserve: the coverage-vs-emptiness distinction (invariant 3), the
 closed-interval `[start, end]` convention, the three write modes and that their window
-is explicit, the UTC timestamp-column contract, the rule that no core module may
-hardcode a kwarg name, and that the frame layer is polars core + a thin pandas facade
-with pushed-down scans on the read path.
+is explicit, the UTC timestamp-column contract, that row identity is
+`(timestamp, *identity_columns)` while coverage stays purely time-based, the rule that
+no core module may hardcode a kwarg name, and that the frame layer is polars core + a
+thin pandas facade with pushed-down scans on the read path.

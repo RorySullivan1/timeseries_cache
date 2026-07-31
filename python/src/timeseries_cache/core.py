@@ -18,6 +18,7 @@ import polars as pl
 from .backends.base import StorageBackend
 from .errors import (
     IndexContractError,
+    InvalidIdentityError,
     OverlappingWriteError,
     SchemaMismatchError,
     WindowError,
@@ -38,13 +39,20 @@ than truncated.
 DEFAULT_TIMESTAMP_COLUMN = "ts"
 
 
-def _has_adjacent_duplicate(frame: pl.DataFrame, column: str) -> bool:
-    """Duplicate check for a column already known to be sorted.
+def _has_adjacent_duplicate(frame: pl.DataFrame, columns: Sequence[str]) -> bool:
+    """Duplicate check for columns already known to be sorted.
 
     On sorted data a repeat can only sit next to its twin, so one linear pass
     answers it — no hash set over every row, which is what ``n_unique`` costs.
+    A composite key repeats only when *every* component matches its predecessor.
     """
-    return bool(frame.select((pl.col(column) == pl.col(column).shift(1)).any()).item())
+    return bool(
+        frame.select(
+            pl.all_horizontal(
+                [pl.col(name) == pl.col(name).shift(1) for name in columns]
+            ).any()
+        ).item()
+    )
 
 
 class WriteMode(StrEnum):
@@ -89,6 +97,17 @@ class TimeseriesCache:
     Reserved names (``start``, ``end``, ``mode``, ``columns``, ``frame``) are
     control parameters and cannot double as cache kwargs; passing one raises
     :class:`~timeseries_cache.errors.InvalidKwargError`.
+
+    Args:
+        backend: Where the bytes live.
+        timestamp_column: The designated UTC timestamp column.
+        identity_columns: Extra columns that, together with the timestamp,
+            identify a row. Empty (the default) means the timestamp alone is the
+            identity and must be unique. Supplying them — ``("trade_id",)`` for
+            trade data, where many prints share a timestamp — makes
+            ``(timestamp, *identity_columns)`` the unit of uniqueness *and* the
+            unit an ``upsert`` overwrites. Coverage stays purely time-based
+            either way; only row identity changes.
     """
 
     def __init__(
@@ -96,9 +115,28 @@ class TimeseriesCache:
         backend: StorageBackend,
         *,
         timestamp_column: str = DEFAULT_TIMESTAMP_COLUMN,
+        identity_columns: Sequence[str] = (),
     ) -> None:
+        if timestamp_column in identity_columns:
+            raise InvalidIdentityError(
+                f"{timestamp_column!r} is the timestamp column and is always part "
+                "of a row's identity; list only the *extra* columns in "
+                "identity_columns"
+            )
+        if len(set(identity_columns)) != len(identity_columns):
+            raise InvalidIdentityError(
+                f"identity_columns has repeats: {list(identity_columns)}"
+            )
         self.backend = backend
         self.timestamp_column = timestamp_column
+        self.identity_columns = tuple(identity_columns)
+
+    @property
+    def row_key(self) -> tuple[str, ...]:
+        """The columns that identify a row: the timestamp plus any identity
+        columns. This is what uniqueness is enforced on and what an ``upsert``
+        matches against."""
+        return (self.timestamp_column, *self.identity_columns)
 
     # ---------------------------------------------------------------- helpers
 
@@ -109,6 +147,7 @@ class TimeseriesCache:
         manifest = self.backend.read_manifest(key)
         if manifest is not None:
             manifest.verify(key)
+            manifest.verify_identity(self.identity_columns)
         return manifest
 
     def _is_schemaless_empty(self, frame: pl.DataFrame) -> bool:
@@ -158,20 +197,54 @@ class TimeseriesCache:
         if frame.select(pl.col(column).is_null().any()).item():
             raise IndexContractError(f"{column!r} contains null timestamps")
 
-        # Callers usually hand over data that is already in order; checking is a
-        # linear pass, whereas sorting it again is not.
-        if not frame.get_column(column).is_sorted():
-            frame = frame.sort(column)
+        row_key = self.row_key
+        if missing := [c for c in self.identity_columns if c not in frame.columns]:
+            raise InvalidIdentityError(
+                f"identity column(s) {missing} are not in the frame; available: "
+                f"{frame.columns}"
+            )
+        for name in self.identity_columns:
+            if frame.select(pl.col(name).is_null().any()).item():
+                raise InvalidIdentityError(
+                    f"identity column {name!r} contains nulls; a null cannot "
+                    "identify a row"
+                )
 
-        if frame.height > 1 and _has_adjacent_duplicate(frame, column):
-            duplicates = frame.height - frame.select(pl.col(column).n_unique()).item()
+        # Sort on the full row key, not just the timestamp: with identity
+        # columns the stored order has to be deterministic among rows sharing a
+        # timestamp, or a round-trip wouldn't be stable and the adjacent-
+        # duplicate check below would miss pairs that aren't neighbours.
+        # Callers usually hand over ordered data, and checking is a linear pass
+        # where sorting again is not.
+        if not self._is_sorted_by(frame, row_key):
+            frame = frame.sort(row_key)
+
+        if frame.height > 1 and _has_adjacent_duplicate(frame, row_key):
+            unique = frame.select(pl.struct(row_key).n_unique()).item()
+            duplicates = frame.height - unique
+            if self.identity_columns:
+                raise IndexContractError(
+                    f"{duplicates} row(s) repeat the identity {row_key}. "
+                    "Timestamps may repeat, but the timestamp together with "
+                    "identity_columns must be unique."
+                )
             raise IndexContractError(
                 f"{column!r} has {duplicates} duplicate timestamp(s). The index "
-                "must be unique; aggregate or de-duplicate before writing."
+                "must be unique; pass identity_columns if rows legitimately "
+                "share a timestamp (e.g. trades), or de-duplicate before writing."
             )
         # Mark the invariant so downstream merges can rely on it without a
         # re-check; every path out of this function is sorted.
         return frame.with_columns(pl.col(column).set_sorted())
+
+    @staticmethod
+    def _is_sorted_by(frame: pl.DataFrame, columns: Sequence[str]) -> bool:
+        """Whether the frame is already ordered by the given columns."""
+        if len(columns) == 1:
+            return bool(frame.get_column(columns[0]).is_sorted())
+        # No composite `is_sorted`, so compare against the sorted key columns.
+        keys = frame.select(columns)
+        return keys.equals(keys.sort(list(columns)))
 
     @staticmethod
     def _schema_of(frame: pl.DataFrame) -> dict[str, str]:
@@ -316,9 +389,14 @@ class TimeseriesCache:
         return ReadResult(frame=frame, requested=window, missing=missing)
 
     def _selection(self, columns: Iterable[str]) -> list[str]:
-        """Always project the timestamp column, without duplicating it."""
-        chosen = [self.timestamp_column]
-        chosen.extend(c for c in columns if c != self.timestamp_column)
+        """Always project the row key, without duplicating it.
+
+        Identity columns come back whether or not they were asked for, same as
+        the timestamp: a projection that dropped them would hand the caller rows
+        it cannot tell apart.
+        """
+        chosen = list(self.row_key)
+        chosen.extend(c for c in columns if c not in self.row_key)
         return chosen
 
     @staticmethod
@@ -420,7 +498,11 @@ class TimeseriesCache:
 
         merged = self._merge(existing, incoming, window, mode, schemaless_empty)
 
-        base = manifest or Manifest.new(key, timestamp_column=self.timestamp_column)
+        base = manifest or Manifest.new(
+            key,
+            timestamp_column=self.timestamp_column,
+            identity_columns=self.identity_columns,
+        )
         updated = base.updated(
             coverage=base.coverage.union(window),
             schema=self._schema_of(merged) if merged.width else base.schema,
@@ -469,8 +551,13 @@ class TimeseriesCache:
                 )
             )
         elif mode is WriteMode.UPSERT:
+            # Anti-join on the *row key*, not the timestamp alone. With identity
+            # columns this is the whole point: two trades sharing a timestamp are
+            # different rows, so an incoming trade must displace only its own
+            # prior version, not every print at that instant.
+            row_key = list(self.row_key)
             kept = existing_lazy.join(
-                incoming.lazy().select(column), on=column, how="anti"
+                incoming.lazy().select(row_key), on=row_key, how="anti"
             )
         else:  # APPEND_ONLY — coverage was already proven disjoint
             kept = existing_lazy
@@ -482,16 +569,19 @@ class TimeseriesCache:
         # nearly-ordered input that beats the interleave. Re-measure before
         # swapping this; don't swap it on principle.
         merged = (
-            pl.concat([kept, incoming.lazy()], how="vertical").sort(column).collect()
+            pl.concat([kept, incoming.lazy()], how="vertical")
+            .sort(list(self.row_key))
+            .collect()
         )
 
         # Cheaper than `n_unique()` (which builds a hash set over every row):
-        # on a sorted column a repeat can only be adjacent.
-        if merged.height > 1 and _has_adjacent_duplicate(merged, column):
+        # on sorted data a repeat can only be adjacent.
+        if merged.height > 1 and _has_adjacent_duplicate(merged, self.row_key):
             # pragma: no cover - defensive; the modes above should prevent it
             raise IndexContractError(
-                f"merge produced duplicate timestamp(s) under mode "
-                f"{mode.value}; this is a bug in the cache, not in your data"
+                f"merge produced rows repeating the identity {self.row_key} "
+                f"under mode {mode.value}; this is a bug in the cache, not in "
+                "your data"
             )
         return merged
 

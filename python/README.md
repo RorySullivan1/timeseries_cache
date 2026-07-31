@@ -43,6 +43,38 @@ it covers and that range stops being asked for:
 cache.write(pd.DataFrame(), start=holiday, end=holiday, **series)
 ```
 
+## Rows that share a timestamp
+
+By default the timestamp identifies a row and must be unique. Plenty of data isn't
+shaped that way — trades print many times at the same instant, each with its own
+id. Name the disambiguating column(s) and the timestamp is free to repeat:
+
+```python
+cache = open_pandas_cache(root, identity_columns=("trade_id",))
+cache.write(book, **series)  # DatetimeIndex with repeats: fine
+```
+
+Identity becomes `(ts, trade_id)`, and that is what an `upsert` matches on — so
+correcting one trade leaves its neighbours at the same instant alone:
+
+```python
+# T1, T2, T3 all print at 14:30:00. Correct only T3.
+cache.write(corrected_t3, start=t, end=t, **series)
+# -> T3 updated; T1 and T2 untouched
+```
+
+Pass several columns for a composite (`("venue", "trade_id")`). The index stays the
+timestamp on the pandas side — identity columns are ordinary columns, not extra
+index levels — and they come back on every read whether or not you project them.
+
+A key records the identity it was written under; opening it with a different one
+raises rather than quietly changing what "the same row" means.
+
+**Coverage is unaffected.** Identity columns change what a *row* is, never what a
+*range* means, so `replace_window`, `delete`, and gap reporting stay purely
+temporal. To actually drop a busted trade, `replace_window` over its instant —
+`upsert` has nothing to overwrite it with.
+
 ## Write modes
 
 All three take an **explicit** target window rather than deriving one from the
@@ -50,7 +82,7 @@ incoming data's min/max.
 
 | Mode | Effect |
 |---|---|
-| `upsert` (default) | Incoming rows replace matching timestamps; rows outside the incoming index survive. |
+| `upsert` (default) | Incoming rows replace those with a matching row key; rows outside the incoming set survive. |
 | `replace_window` | Delete *everything* in `[start, end]`, then insert. |
 | `append_only` | Reject any write overlapping existing coverage. |
 
@@ -65,8 +97,10 @@ cache.write(corrected, start=t0, end=t1, mode="replace_window", **series)
 
 ## Contract
 
-- Timestamps are **tz-aware UTC**, sorted, unique. Naive input is rejected, never
-  silently localized. Other zones are converted.
+- Timestamps are **tz-aware UTC** and sorted. Naive input is rejected, never silently
+  localized. Other zones are converted.
+- A row is identified by `(timestamp, *identity_columns)`. With no identity columns —
+  the default — that is the timestamp alone, and it must be unique.
 - Storage resolution is **microseconds**; sub-microsecond input is rejected
   rather than truncated.
 - Ranges are **closed on both ends**, `[start, end]` — matching both
@@ -145,7 +179,8 @@ below.
   not the size of the change. Partition into more keys, or across time, if a
   single key grows large enough for that to hurt.
 - **Schema is fixed per key.** Adding or retyping a column is refused rather than
-  migrated. Delete the key or migrate it deliberately.
+  migrated. Delete the key or migrate it deliberately. The same goes for
+  `identity_columns`: a key can't change its notion of row identity in place.
 
 ## Development
 

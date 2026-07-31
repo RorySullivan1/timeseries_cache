@@ -16,7 +16,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Final
 
-from .errors import CacheKeyCollisionError
+from .errors import CacheKeyCollisionError, InvalidIdentityError
 from .intervals import IntervalSet
 from .keys import CacheKey
 
@@ -52,6 +52,7 @@ class Manifest:
     row_count: int
     created_at: datetime
     updated_at: datetime
+    identity_columns: tuple[str, ...] = ()
     format_version: int = FORMAT_VERSION
 
     @classmethod
@@ -60,6 +61,7 @@ class Manifest:
         key: CacheKey,
         *,
         timestamp_column: str,
+        identity_columns: tuple[str, ...] = (),
         now: datetime | None = None,
     ) -> Manifest:
         stamp = now or datetime.now(UTC)
@@ -73,6 +75,7 @@ class Manifest:
             row_count=0,
             created_at=stamp,
             updated_at=stamp,
+            identity_columns=identity_columns,
         )
 
     def updated(
@@ -104,6 +107,23 @@ class Manifest:
                 "overwrite another series' data."
             )
 
+    def verify_identity(self, identity_columns: tuple[str, ...]) -> None:
+        """Fail if the caller's row identity differs from what this key holds.
+
+        Reading trade data keyed on ``(ts, trade_id)`` through a cache
+        configured for ``ts`` alone would mean two different answers to "is this
+        the same row", and an ``upsert`` under the wrong one silently destroys
+        rows it should have kept.
+        """
+        if self.identity_columns != identity_columns:
+            stored = list(self.identity_columns) or "none"
+            asked = list(identity_columns) or "none"
+            raise InvalidIdentityError(
+                f"this key was written with identity_columns={stored}, but the "
+                f"cache is configured with identity_columns={asked}. Open the "
+                "cache with the identity the data was written under."
+            )
+
     def to_json(self) -> str:
         payload = {
             "format_version": self.format_version,
@@ -111,6 +131,7 @@ class Manifest:
             "canonical": self.canonical,
             "kwargs": {k: _jsonable(v) for k, v in self.kwargs.items()},
             "timestamp_column": self.timestamp_column,
+            "identity_columns": list(self.identity_columns),
             "coverage": self.coverage.to_payload(),
             "schema": self.schema,
             "row_count": self.row_count,
@@ -133,6 +154,10 @@ class Manifest:
             canonical=payload["canonical"],
             kwargs=payload["kwargs"],
             timestamp_column=payload["timestamp_column"],
+            # `.get` rather than `[...]`: manifests written before identity
+            # columns existed have no such field, and their behavior *was*
+            # "timestamp alone", which is exactly the default.
+            identity_columns=tuple(payload.get("identity_columns", ())),
             coverage=IntervalSet.from_payload(payload["coverage"]),
             schema=payload["schema"],
             row_count=int(payload["row_count"]),
