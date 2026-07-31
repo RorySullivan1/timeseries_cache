@@ -1,0 +1,37 @@
+# MEMORY INDEX  ·  keep ≤ ~80 lines
+
+## State            (rewrite in place — current truth only, ≤ ~10 lines)
+- `python/` is complete: 251 tests green, ruff + `mypy --strict` clean, uv-managed. No other language port.
+- PR #1 open against main; code review applied (2 silent-corruption fixes + read-path tuning).
+- CLAUDE.md now describes shipped code, not a plan. All five invariants are implemented.
+- Frame layer: polars core + thin pandas facade. Consumers are mostly pandas.
+- Claude assets ported from `RorySullivan1/claudeBrain` (`example-project/.claude/` is the source to copy from).
+
+## Decisions        (append-only; supersede, never delete)
+- [2026-07-31] Repo is language-partitioned at top level, Python first — each language a self-contained impl of one shared contract — because the deliverable is a copyable template, not a package. — sessions/2026-07-31-1841-bootstrap-claude-md.md
+- [2026-07-31] Coverage is tracked in a per-key manifest, separate from stored rows, so "fetched and legitimately empty" is distinguishable from "never fetched". This is the core design bet. — sessions/2026-07-31-1841-bootstrap-claude-md.md
+- [2026-07-31] Public interval convention is closed `[start, end]` to match pandas `.loc`; internals use the same convention throughout. — sessions/2026-07-31-1841-bootstrap-claude-md.md
+- [2026-07-31] Write modes take an *explicit* window, never one inferred from the incoming data's min/max — that's what makes `replace_window` able to delete stale rows. — sessions/2026-07-31-1841-bootstrap-claude-md.md
+- [2026-07-31] Ported python-development/review/maintenance, financial-timeseries-analysis, session-memory, and an adapted python-developer agent; skipped coding-standards (C#/VSTO-heavy) and the python whole-stack brief (redundant). — sessions/2026-07-31-1841-bootstrap-claude-md.md
+- [2026-07-31] Frame layer is **polars core + pandas facade**, not pandas. Decisive reason: `scan_parquet` + pushed-down time predicate on the read path, which is the whole game for a `[start, end]` API, plus no-index removes the write-mode bug class. Asymmetry sealed it — polars→pandas is one boundary call, pandas→polars later means retrofitting the read path. — sessions/2026-07-31-1841-bootstrap-claude-md.md
+- [2026-07-31] Two typed facades (`TimeseriesCache` polars / `PandasTimeseriesCache` pandas) rather than a `frame=` param, so return types stay static for the type checker. Consumers are mostly pandas, so the facade is first-class, not an afterthought. — sessions/2026-07-31-1841-bootstrap-claude-md.md
+- [2026-07-31] pandas conversion is numpy-backed by default (no `use_pyarrow_extension_array`): arrow-backed nulls differ from `np.nan` and would silently change downstream `pct_change`/`rolling`/`dropna`. — sessions/2026-07-31-1841-bootstrap-claude-md.md
+- [2026-07-31] Time domain is discrete at 1 microsecond; storage dtype is `Datetime("us","UTC")`. This is what makes closed-interval subtraction closable and "touching" well-defined. Sub-microsecond input is rejected, not truncated. — sessions/2026-07-31-1908-python-implementation.md
+- [2026-07-31] Kwarg canonicalization is type-tagged (`i:1` vs `s:1`), bool checked before int, sets/dicts rejected. Untagged, `1` and `"1"` would silently share a cache entry. — sessions/2026-07-31-1908-python-implementation.md
+- [2026-07-31] Schema checks compare the *live* polars schema of the stored frame; the manifest's schema strings are informational only. A string comparison would make a polars `repr` change invalidate every cache on disk. — sessions/2026-07-31-1908-python-implementation.md
+- [2026-07-31] `open_cache`/`open_pandas_cache` live in `__init__.py`, not `core.py`, so `core` never imports a concrete backend while callers still get a one-liner. — sessions/2026-07-31-1908-python-implementation.md
+- [2026-07-31] Kwargs canonicalize to a tagged *structure* serialized as JSON, superseding the `name=value&...` string join, which was forgeable: a value containing the separators produced an identical canonical string and served another series' rows. Digests changed as a result. — sessions/2026-07-31-2001-review-fixes.md
+- [2026-07-31] Write ordering rule is "the interruptible middle state must under-claim", not "manifest last": growing updates write data first, shrinking ones (`delete`) write the manifest first. — sessions/2026-07-31-2001-review-fixes.md
+- [2026-07-31] `DEFAULT_ROW_GROUP_SIZE = 64_000` — row groups are the parquet skip unit and every read is a time range, so finer groups buy ~1.35x on narrow reads for free. This is the read path's real lever. — sessions/2026-07-31-2001-review-fixes.md
+- [2026-07-31] Kept `concat + sort` over `merge_sorted` in `_merge`: measured faster in 5 of 6 shapes on polars 1.43 despite both inputs being sorted. Re-measure on a polars upgrade; don't swap on principle. — sessions/2026-07-31-2001-review-fixes.md
+
+## Threads          (open items; remove when closed)
+- Hooks invoke `python`, not `python3`; will silently no-op on a `python3`-only machine.
+- No CI workflow — the toolchain commands are documented but nothing runs them on push.
+- Interval algebra + cache semantics were fuzzed once by hand and came back clean; worth wiring in as property tests rather than a one-off.
+- No second language port; the backend protocol + manifest JSON are the intended seam.
+- Accepted (not bugs): single-writer per key, whole-key rewrite per write, schema fixed per key.
+
+## Log              (append-only pointers)
+- 2026-07-31 1841 | bootstrap CLAUDE.md + claudeBrain asset port | sessions/2026-07-31-1841-bootstrap-claude-md.md
+- 2026-07-31 1908 | Python implementation: coverage manifest, write modes, both facades | sessions/2026-07-31-1908-python-implementation.md

@@ -1,0 +1,46 @@
+[project]
+name = "timeseries-cache"
+version = "0.1.0"
+description = "Lightweight cache for datetime-indexed data, with surgical overwrite and coverage tracking"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["polars>=1.0"]
+
+[project.optional-dependencies]
+pandas = ["pandas>=2.0", "pyarrow>=15.0"]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.10",
+    "pandas-stubs",
+    "pytest>=8.0",
+    "ruff>=0.5",
+    "timeseries-cache[pandas]",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/timeseries_cache"]
+
+[tool.ruff]
+line-length = 88
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src"]
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
