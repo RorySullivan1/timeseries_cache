@@ -158,3 +158,6 @@ uv run pytest tests/test_core.py::TestReplaceWindow -q   # a single class
 
 Behavioral tests are parametrized over the memory and parquet backends, and the
 core scenarios run through both the polars and pandas facades.
+
+CI runs all four commands on Python 3.11, 3.12, and 3.13 for every push to `main`
+and every pull request.

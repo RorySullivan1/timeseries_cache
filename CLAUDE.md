@@ -188,6 +188,17 @@ Python 3.11+, ruff (88 cols), mypy on `src`, pytest. Runtime deps: `polars` in t
 core; `pandas` + `pyarrow` under a `[pandas]` extra. Install dev with the extra so the
 facade's tests run.
 
+`.github/workflows/ci.yml` runs all four commands on push to `main` and on every PR,
+across Python 3.11/3.12/3.13. No `uv.lock` is committed — a template should be
+re-resolved by whoever copies it — so CI resolves fresh each run and an upstream
+release can turn it red without a local change. That is intended: for a template,
+finding out early beats a lock that hides it.
+
+Mypy's target is deliberately **not** pinned in `pyproject.toml`. It checks against
+whatever interpreter it runs under, so the 3.11 job is what guarantees the floor in
+`requires-python`; pinning to the minimum instead makes newer runtimes fail on their
+own dependencies' stubs.
+
 ## Testing expectations
 
 The cache's bugs live in the seams, not the happy path. Any change to coverage or

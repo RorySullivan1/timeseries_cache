@@ -33,7 +33,10 @@ src = ["src", "tests"]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
 [tool.mypy]
-python_version = "3.11"
+# Deliberately unpinned: mypy targets whatever interpreter it runs under, and
+# CI runs it on every supported version. Pinning to the minimum instead makes
+# newer runtimes fail on their own dependencies' stubs — numpy's use `type`
+# statements, which a 3.11 target rejects as a syntax error.
 strict = true
 files = ["src"]
 
