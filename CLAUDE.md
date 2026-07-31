@@ -208,10 +208,16 @@ core; `pandas` + `pyarrow` under a `[pandas]` extra. Install dev with the extra 
 facade's tests run.
 
 `.github/workflows/ci.yml` runs all four commands on push to `main` and on every PR,
-across Python 3.11/3.12/3.13. No `uv.lock` is committed — a template should be
-re-resolved by whoever copies it — so CI resolves fresh each run and an upstream
-release can turn it red without a local change. That is intended: for a template,
-finding out early beats a lock that hides it.
+across Python 3.11/3.12/3.13 on **both ubuntu and windows**. Windows is not
+decoration: POSIX lets you replace or unlink an open file and Windows refuses, and
+that difference alone produced three bugs a Linux-only suite could not reach —
+including writes to an existing key failing outright. Anything touching file
+handles, `os.replace`, `fsync`, or temp files needs to be reasoned about for both.
+
+No `uv.lock` is committed — a template should be re-resolved by whoever copies it —
+so CI resolves fresh each run and an upstream release can turn it red without a
+local change. That is intended: for a template, finding out early beats a lock that
+hides it.
 
 Mypy's target is deliberately **not** pinned in `pyproject.toml`. It checks against
 whatever interpreter it runs under, so the 3.11 job is what guarantees the floor in

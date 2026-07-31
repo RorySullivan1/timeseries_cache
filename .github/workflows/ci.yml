@@ -12,13 +12,19 @@ concurrency:
 
 jobs:
   python:
-    name: python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }} · python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
     strategy:
-      # Report every version's result rather than stopping at the first red one:
-      # a failure on the oldest and the newest mean different things.
+      # Report every combination rather than stopping at the first red one: a
+      # failure on the oldest version, the newest, or one OS and not the other
+      # all mean different things.
       fail-fast: false
       matrix:
+        # Windows earns its place here. POSIX and Windows disagree about open
+        # files — POSIX lets you replace or unlink one, Windows refuses — and
+        # that difference has already produced bugs this suite could not reach
+        # from Linux, including writes to an existing key failing outright.
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.11", "3.12", "3.13"]
     defaults:
       run:
