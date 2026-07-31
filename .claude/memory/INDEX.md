@@ -3,6 +3,7 @@
 ## State            (rewrite in place — current truth only, ≤ ~10 lines)
 - Greenfield. `CLAUDE.md` + `.claude/` exist; no source code, no `python/` dir, no toolchain.
 - CLAUDE.md is a design charter, not a description of code. Its five invariants are unbuilt.
+- Frame layer settled: polars core + thin pandas facade. Consumers are mostly pandas.
 - Claude assets ported from `RorySullivan1/claudeBrain` (`example-project/.claude/` is the source to copy from).
 
 ## Decisions        (append-only; supersede, never delete)
@@ -11,6 +12,9 @@
 - [2026-07-31] Public interval convention is closed `[start, end]` to match pandas `.loc`; internals use the same convention throughout. — sessions/2026-07-31-1841-bootstrap-claude-md.md
 - [2026-07-31] Write modes take an *explicit* window, never one inferred from the incoming data's min/max — that's what makes `replace_window` able to delete stale rows. — sessions/2026-07-31-1841-bootstrap-claude-md.md
 - [2026-07-31] Ported python-development/review/maintenance, financial-timeseries-analysis, session-memory, and an adapted python-developer agent; skipped coding-standards (C#/VSTO-heavy) and the python whole-stack brief (redundant). — sessions/2026-07-31-1841-bootstrap-claude-md.md
+- [2026-07-31] Frame layer is **polars core + pandas facade**, not pandas. Decisive reason: `scan_parquet` + pushed-down time predicate on the read path, which is the whole game for a `[start, end]` API, plus no-index removes the write-mode bug class. Asymmetry sealed it — polars→pandas is one boundary call, pandas→polars later means retrofitting the read path. — sessions/2026-07-31-1841-bootstrap-claude-md.md
+- [2026-07-31] Two typed facades (`TimeseriesCache` polars / `PandasTimeseriesCache` pandas) rather than a `frame=` param, so return types stay static for the type checker. Consumers are mostly pandas, so the facade is first-class, not an afterthought. — sessions/2026-07-31-1841-bootstrap-claude-md.md
+- [2026-07-31] pandas conversion is numpy-backed by default (no `use_pyarrow_extension_array`): arrow-backed nulls differ from `np.nan` and would silently change downstream `pct_change`/`rolling`/`dropna`. — sessions/2026-07-31-1841-bootstrap-claude-md.md
 
 ## Threads          (open items; remove when closed)
 - `python/` is empty — layout, module split, and all five invariants are unimplemented.

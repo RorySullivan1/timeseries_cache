@@ -15,6 +15,16 @@ description: >-
   to every read and write path.
 ---
 
+> **Syntax note for this repo.** The examples below are pandas, but the storage
+> layer is **polars** (see `CLAUDE.md`). Everything here is a statement about
+> *semantics*, and the semantics carry over unchanged — translate the idiom, not
+> the rule. The mapping that matters: a pandas `DatetimeIndex` is a sorted, unique,
+> UTC `ts` column; `.loc[start:end]` is `filter(pl.col("ts").is_between(start, end,
+> closed="both"))`; `shift(1)` is `.shift(1)` over a sorted frame (sort first —
+> polars has no index to guarantee order for you); `rolling(w).std()` is
+> `rolling_std(window_size=w, min_periods=...)`. The look-ahead rules in particular
+> are engine-independent and are the reason this skill is here.
+
 # Financial Time-Series Analysis
 
 Correct handling of price and return series in pandas. The recurring danger is

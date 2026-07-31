@@ -24,9 +24,31 @@
   deferred to `finance-quantitative-developer`. Rewritten for `python/` and this repo's
   invariants; dropped the `model: sonnet` pin so it inherits the session model.
 
+## Frame layer: polars vs pandas (settled this session)
+- Asked as a direct question after the charter landed. Answer: **polars core + pandas
+  facade**, consumers "mostly pandas downstream".
+- Argument that decided it, in order: (1) `pl.scan_parquet(...).filter(is_between(...))`
+  pushes the time predicate into the parquet reader — for an API whose only read verb is
+  `[start, end]`, that's the biggest available lever and pandas can only approximate it;
+  (2) polars has no index, so `replace_window`/`upsert` become explicit
+  filter/concat/`unique(keep="last")`/sort instead of pandas index alignment, removing
+  the bug class invariants 3–4 are most exposed to; (3) polars bundles its own parquet
+  reader, so the core is *lighter* than pandas+pyarrow; (4) the asymmetry — polars→pandas
+  is one boundary call, pandas→polars later is a read-path retrofit.
+- Rejected `frame="pandas"|"polars"` parameter: makes the return type dynamic and defeats
+  the type checker exactly at the caller boundary. Two typed facades instead.
+- Gotcha worth remembering: `.to_pandas(use_pyarrow_extension_array=True)` gives
+  arrow-backed dtypes whose null semantics differ from `np.nan`, which silently changes
+  `pct_change`/`rolling`/`dropna` downstream. Default to numpy-backed.
+- Closed `[start, end]` survives the switch unchanged — it happens to match both polars'
+  `is_between(closed="both")` and pandas `.loc`, so neither facade adjusts bounds.
+
 ## State at end
 - `CLAUDE.md`, `.claude/{skills,agents,settings.json,memory}` in place. No source code,
   no `python/` directory, no toolchain yet.
+- `financial-timeseries-analysis` carries a syntax note: its examples stay pandas, but
+  they're statements about semantics — translate the idiom, not the rule. Includes the
+  pandas→polars mapping for the four idioms that come up most.
 - session-memory hooks wired for SessionStart / UserPromptSubmit / PreCompact / Stop;
   `memory.py index` verified to run under `python3`.
 

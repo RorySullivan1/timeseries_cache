@@ -40,17 +40,22 @@ green toolchain run is the proof.
 5. Keep the storage backends behind the backend protocol. Core logic must not import
    a concrete backend, and nothing in `core`/`keys`/`index` may hardcode a
    domain-specific kwarg name — kwargs are the flexibility axis.
-6. Add or update `pytest` tests for the new behavior and its edge cases. For anything
+6. The core is **polars**; `pandas.py` is a thin boundary facade. Never import pandas
+   in the core, never let polars types or tracebacks escape through the facade, and
+   never collapse a `scan_parquet` read path into an eager read — the pushed-down time
+   predicate is the point.
+7. Add or update `pytest` tests for the new behavior and its edge cases. For anything
    touching coverage or overwrite semantics, the mandatory cases are: empty-vs-unknown
    range, partial-window replacement, overlapping upsert, out-of-order and duplicate
    timestamps, tz-naive input, and an interrupted write leaving the manifest
-   consistent.
+   consistent. Parametrize behavioral tests over both facades rather than covering
+   polars deeply and pandas shallowly.
 
 ## Verify (do not finish until these pass)
-7. Run the project's linter, type checker, and test suite using the exact commands
+8. Run the project's linter, type checker, and test suite using the exact commands
    `CLAUDE.md` defines. If the toolchain isn't wired up yet for the area you touched,
    say so rather than skipping verification silently.
-8. If anything fails, fix it or report it honestly with the real command output —
+9. If anything fails, fix it or report it honestly with the real command output —
    never claim a green run you did not see.
 
 ## Guardrails

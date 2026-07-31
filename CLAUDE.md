@@ -22,7 +22,8 @@ self-contained implementation of the same contract, with its own build config.
 ```
 python/
   src/timeseries_cache/
-    core.py        # TimeseriesCache facade: read / write / delete / coverage
+    core.py        # TimeseriesCache: read / write / delete / coverage (polars in, polars out)
+    pandas.py      # PandasTimeseriesCache: the same API, pandas in, pandas out
     keys.py        # arbitrary kwargs -> stable cache key + storage path
     index.py       # per-key manifest: covered intervals, schema, row counts
     intervals.py   # interval algebra: merge, subtract, gaps
@@ -39,10 +40,13 @@ These are the reason the project exists. Everything else is negotiable.
 
 ### 1. Every cached object is datetime-indexed
 
-The index is tz-aware **UTC**, monotonically increasing, and unique. Naive input is
-rejected at the boundary, never silently localized. This holds for every backend and
-every language port — code may assume it after validation and must enforce it before
-storing.
+Storage is **polars**, so "indexed" means a designated timestamp column — by convention
+`ts` — that is tz-aware **UTC**, sorted ascending, and unique. Naive input is rejected
+at the boundary, never silently localized. This holds for every backend and every
+language port; code may assume it after validation and must enforce it before storing.
+
+A pandas `DatetimeIndex` is a presentation concern, not a storage one — parquet stores a
+column either way. The pandas facade (below) sets and restores the index at the boundary.
 
 ### 2. Cache identity is the kwargs, and the kwargs are open-ended
 
@@ -83,10 +87,11 @@ incoming data's min/max:
 - **`append_only`** — reject any write overlapping existing coverage. For
   append-only sources where an overlap means a bug upstream.
 
-Interval convention: the public API is **closed on both ends, `[start, end]`**, matching
-pandas `.loc` slicing. The interval algebra in `intervals.py` uses the same convention
-throughout — mixing conventions between the API and the internals is the bug this note
-exists to prevent.
+Interval convention: the public API is **closed on both ends, `[start, end]`** — matching
+both polars' `is_between(..., closed="both")` and pandas `.loc` slicing, so neither
+facade has to adjust bounds. The interval algebra in `intervals.py` uses the same
+convention throughout; mixing conventions between the API and the internals is the bug
+this note exists to prevent.
 
 ### 5. A write either lands completely or not at all
 
@@ -95,11 +100,38 @@ updated **last**. An interrupted write may leave an orphaned temp file (harmless
 garbage-collectable) but must never leave the manifest claiming coverage whose rows
 aren't on disk. Prefer over-fetching after a crash to serving a silent hole.
 
+## Frame layer: polars core, pandas facade
+
+Polars is the storage and query engine; pandas is a supported boundary type, because
+most consumers here are pandas.
+
+- **Reads must use `pl.scan_parquet(...)` + a pushed-down time predicate**, not a full
+  read followed by a filter. A cache whose entire read API is `[start, end]` gets its
+  biggest win from only touching row groups that overlap the range. A change that
+  collapses the lazy scan into an eager read is a performance regression, not a
+  refactor — treat it as one.
+- **Two typed facades over one core.** `TimeseriesCache` takes and returns
+  `pl.DataFrame`; `PandasTimeseriesCache` takes and returns `pd.DataFrame` with a
+  `DatetimeIndex`. Same methods, same semantics, static return types. Don't add a
+  `frame=` parameter that makes the return type dynamic — it defeats the type checker
+  at exactly the boundary where callers need it.
+- **The facade is a boundary adapter, nothing more.** It sets/restores the index and
+  converts; it owns no coverage logic, no interval math, no write-mode behavior. If a
+  fix needs to land in both facades, it belongs in the core instead.
+- **Convert to numpy-backed pandas by default** (`to_pandas()` without
+  `use_pyarrow_extension_array=True`). Arrow-backed pandas has different null semantics
+  from `np.nan`, which silently changes how downstream `pct_change`, `rolling`, and
+  `dropna` behave — exactly the code this cache feeds.
+- **Polars must not leak through the pandas facade**, in return values or in exceptions.
+  A caller who only imported `PandasTimeseriesCache` should never see a `polars`
+  traceback or type.
+
 ## Design constraints
 
-- **Light by default.** The core targets stdlib + pandas. Parquet/pyarrow and any
-  remote filesystem are optional extras behind the backend protocol — core logic must
-  not import a concrete backend.
+- **Light by default.** The core targets stdlib + polars, which brings its own parquet
+  reader — no pyarrow needed. `pyarrow` and `pandas` are a `[pandas]` extra, pulled in
+  only by the facade; remote filesystems are a separate extra behind the backend
+  protocol. Core logic must not import a concrete backend.
 - **The backend protocol is the porting seam.** Adding object storage, or porting to
   another language, should touch the backend and the serialization of the manifest,
   not the coverage logic.
@@ -120,7 +152,9 @@ below stay true:
 | Tests | `uv run pytest` |
 | A single test | `uv run pytest tests/test_core.py::test_replace_window_removes_stale_rows` |
 
-Python 3.11+, ruff (88 cols), mypy on `src`, pytest.
+Python 3.11+, ruff (88 cols), mypy on `src`, pytest. Runtime deps: `polars` in the
+core; `pandas` + `pyarrow` under a `[pandas]` extra. Install dev with the extra so the
+facade's tests run.
 
 ## Testing expectations
 
@@ -130,6 +164,12 @@ partial-window replacement, overlapping upsert, out-of-order and duplicate times
 tz-naive input, DST boundaries, and an interrupted write leaving the manifest
 consistent. Use the memory backend for logic, and exercise at least the round-trip
 against the real filesystem backend.
+
+Both facades must be tested against the same behavioral cases — parametrize over them
+rather than testing polars deeply and pandas shallowly. The pandas facade additionally
+needs: index round-trip (a frame written and read back is `assert_frame_equal` to the
+original, index name, dtype, and tz included), and that column dtypes come back
+numpy-backed.
 
 ## Capabilities
 
@@ -160,5 +200,6 @@ can't recover from the code.
 
 On compaction, preserve: the coverage-vs-emptiness distinction (invariant 3), the
 closed-interval `[start, end]` convention, the three write modes and that their window
-is explicit, the UTC index contract, and the rule that no core module may hardcode a
-kwarg name.
+is explicit, the UTC timestamp-column contract, the rule that no core module may
+hardcode a kwarg name, and that the frame layer is polars core + a thin pandas facade
+with pushed-down scans on the read path.
