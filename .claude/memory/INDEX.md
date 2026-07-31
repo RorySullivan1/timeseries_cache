@@ -1,8 +1,8 @@
 # MEMORY INDEX  ·  keep ≤ ~80 lines
 
 ## State            (rewrite in place — current truth only, ≤ ~10 lines)
-- `python/` is complete: 314 tests green, ruff + `mypy --strict` clean on 3.11/3.12/3.13. No other language port.
-- Both PRs merged. main = `705fe3b` (CI + composite row identity); no branch in flight.
+- `python/` is complete: 325 tests green, ruff + `mypy --strict` clean on 3.11/3.12/3.13. No other language port.
+- PRs #1 and #2 merged; main = `193b392`. PR #3 open on `claude/tutorials` (runnable examples).
 - Row identity is `(timestamp, *identity_columns)`; default `()` = timestamp alone, unchanged behavior.
 - Remote branch deletion returns 403 from this environment's git proxy — must be done in the GitHub UI.
 - CLAUDE.md now describes shipped code, not a plan. All five invariants are implemented.
@@ -31,10 +31,11 @@
 - [2026-07-31] Row identity is `(timestamp, *identity_columns)`, set per cache instance; the upsert anti-join, sorting, and duplicate detection all key on it. Driven by trade data, where correcting one print must not wipe the others at that instant. — sessions/2026-07-31-2021-composite-row-identity.md
 - [2026-07-31] Coverage stays purely time-based under composite identity: identity changes what a *row* is, never what a *range* means. `replace_window`/`delete`/gaps untouched. — sessions/2026-07-31-2021-composite-row-identity.md
 - [2026-07-31] The manifest records `identity_columns` and refuses a mismatch either way; missing field reads as timestamp-only, so no FORMAT_VERSION bump was needed. — sessions/2026-07-31-2021-composite-row-identity.md
+- [2026-07-31] Tutorials are plain runnable scripts, not notebooks (no jupyter dep, diff cleanly, no stale output), and are executed by `tests/test_tutorials.py` so a breaking API change fails the build. — sessions/2026-07-31-2037-tutorials.md
 
 ## Threads          (open items; remove when closed)
 - Hooks invoke `python`, not `python3`; will silently no-op on a `python3`-only machine.
-- Both merged branches still exist on origin (`claude/timeseries-cache-template-pq0v1e`, `claude/ci-workflow`) — deletion 403s from here, needs the GitHub UI.
+- PR #3 (tutorials) not merged. Merged branches still on origin — deletion 403s from here, needs the GitHub UI.
 - Interval algebra + cache semantics were fuzzed once by hand and came back clean; worth wiring in as property tests rather than a one-off.
 - No second language port; the backend protocol + manifest JSON are the intended seam.
 - Accepted (not bugs): single-writer per key, whole-key rewrite per write, schema and identity fixed per key.
@@ -45,3 +46,4 @@
 - 2026-07-31 2001 | review fixes: key forgery, delete ordering, row-group tuning | sessions/2026-07-31-2001-review-fixes.md
 - 2026-07-31 2012 | merge PR #1 to main; CI workflow on PR #2 | sessions/2026-07-31-2012-merge-and-ci.md
 - 2026-07-31 2021 | composite row identity for repeating timestamps | sessions/2026-07-31-2021-composite-row-identity.md
+- 2026-07-31 2037 | runnable tutorials, tested in CI | sessions/2026-07-31-2037-tutorials.md
