@@ -1,7 +1,8 @@
 # MEMORY INDEX  ·  keep ≤ ~80 lines
 
 ## State            (rewrite in place — current truth only, ≤ ~10 lines)
-- `python/` is complete: 237 tests green, ruff + `mypy --strict` clean, uv-managed. No other language port.
+- `python/` is complete: 251 tests green, ruff + `mypy --strict` clean, uv-managed. No other language port.
+- PR #1 open against main; code review applied (2 silent-corruption fixes + read-path tuning).
 - CLAUDE.md now describes shipped code, not a plan. All five invariants are implemented.
 - Frame layer: polars core + thin pandas facade. Consumers are mostly pandas.
 - Claude assets ported from `RorySullivan1/claudeBrain` (`example-project/.claude/` is the source to copy from).
@@ -19,10 +20,15 @@
 - [2026-07-31] Kwarg canonicalization is type-tagged (`i:1` vs `s:1`), bool checked before int, sets/dicts rejected. Untagged, `1` and `"1"` would silently share a cache entry. — sessions/2026-07-31-1908-python-implementation.md
 - [2026-07-31] Schema checks compare the *live* polars schema of the stored frame; the manifest's schema strings are informational only. A string comparison would make a polars `repr` change invalidate every cache on disk. — sessions/2026-07-31-1908-python-implementation.md
 - [2026-07-31] `open_cache`/`open_pandas_cache` live in `__init__.py`, not `core.py`, so `core` never imports a concrete backend while callers still get a one-liner. — sessions/2026-07-31-1908-python-implementation.md
+- [2026-07-31] Kwargs canonicalize to a tagged *structure* serialized as JSON, superseding the `name=value&...` string join, which was forgeable: a value containing the separators produced an identical canonical string and served another series' rows. Digests changed as a result. — sessions/2026-07-31-2001-review-fixes.md
+- [2026-07-31] Write ordering rule is "the interruptible middle state must under-claim", not "manifest last": growing updates write data first, shrinking ones (`delete`) write the manifest first. — sessions/2026-07-31-2001-review-fixes.md
+- [2026-07-31] `DEFAULT_ROW_GROUP_SIZE = 64_000` — row groups are the parquet skip unit and every read is a time range, so finer groups buy ~1.35x on narrow reads for free. This is the read path's real lever. — sessions/2026-07-31-2001-review-fixes.md
+- [2026-07-31] Kept `concat + sort` over `merge_sorted` in `_merge`: measured faster in 5 of 6 shapes on polars 1.43 despite both inputs being sorted. Re-measure on a polars upgrade; don't swap on principle. — sessions/2026-07-31-2001-review-fixes.md
 
 ## Threads          (open items; remove when closed)
 - Hooks invoke `python`, not `python3`; will silently no-op on a `python3`-only machine.
 - No CI workflow — the toolchain commands are documented but nothing runs them on push.
+- Interval algebra + cache semantics were fuzzed once by hand and came back clean; worth wiring in as property tests rather than a one-off.
 - No second language port; the backend protocol + manifest JSON are the intended seam.
 - Accepted (not bugs): single-writer per key, whole-key rewrite per write, schema fixed per key.
 
