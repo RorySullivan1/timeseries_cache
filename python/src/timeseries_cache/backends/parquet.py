@@ -13,6 +13,7 @@ import contextlib
 import os
 import shutil
 import tempfile
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Final, Literal
@@ -38,6 +39,22 @@ time and file size unchanged. Below ~16k the write cost starts climbing and wide
 reads get worse, so this is near the knee rather than as small as possible.
 """
 
+DEFAULT_REPLACE_ATTEMPTS: Final[int] = 5
+DEFAULT_REPLACE_BACKOFF: Final[float] = 0.1
+"""Retry budget for the final rename.
+
+POSIX never needs this — a file there can be replaced while open. Windows
+cannot, and on a network or DFS share the set of things that transiently hold a
+file open is large and outside your control: DFS Replication, the file server's
+indexer, antivirus, another client that just read the same key. Those clear in
+milliseconds, so a short bounded retry converts a hard failure into a pause.
+
+Bounded on purpose. A genuine permission problem should still surface quickly
+rather than being buried under a minute of retries, and retrying cannot corrupt
+anything: ``os.replace`` either happened or it didn't, and the source file is
+still there either way.
+"""
+
 
 class ParquetBackend:
     """Stores each key as a parquet file plus a JSON manifest.
@@ -54,6 +71,14 @@ class ParquetBackend:
             Disabling it is faster (~24ms per write on the machine this was
             measured on) but gives up the crash guarantee in invariant 5: after
             a power loss the manifest may be durable while its rows are not.
+        replace_attempts: How many times to try the final rename before giving
+            up. Only relevant on Windows, where a file cannot be replaced while
+            anything holds it open — and on a network or DFS share plenty of
+            things transiently do: DFS Replication, the server's indexer,
+            antivirus, another client. Each retry backs off, doubling from
+            ``replace_backoff``. Set to 1 to fail immediately.
+        replace_backoff: Seconds before the second attempt, doubling thereafter.
+            The default gives up after roughly 1.5s of trying.
     """
 
     def __init__(
@@ -63,11 +88,17 @@ class ParquetBackend:
         compression: ParquetCompression = "zstd",
         row_group_size: int | None = DEFAULT_ROW_GROUP_SIZE,
         fsync: bool = True,
+        replace_attempts: int = DEFAULT_REPLACE_ATTEMPTS,
+        replace_backoff: float = DEFAULT_REPLACE_BACKOFF,
     ) -> None:
+        if replace_attempts < 1:
+            raise ValueError("replace_attempts must be at least 1")
         self.root = Path(root)
         self.compression = compression
         self.row_group_size = row_group_size
         self.fsync = fsync
+        self.replace_attempts = replace_attempts
+        self.replace_backoff = replace_backoff
 
     def _dir(self, key: CacheKey) -> Path:
         return self.root / key.shard / key.digest
@@ -107,7 +138,13 @@ class ParquetBackend:
 
         def put_data() -> None:
             if frame.width:
-                self._atomic_write(directory / DATA_NAME, write_data, fsync=self.fsync)
+                self._atomic_write(
+                    directory / DATA_NAME,
+                    write_data,
+                    fsync=self.fsync,
+                    attempts=self.replace_attempts,
+                    backoff=self.replace_backoff,
+                )
             else:
                 # A schema-less empty write: there is no frame to store, only a
                 # coverage claim. Drop any stale data file rather than leave rows
@@ -116,7 +153,11 @@ class ParquetBackend:
 
         def put_manifest() -> None:
             self._atomic_write(
-                directory / MANIFEST_NAME, write_manifest, fsync=self.fsync
+                directory / MANIFEST_NAME,
+                write_manifest,
+                fsync=self.fsync,
+                attempts=self.replace_attempts,
+                backoff=self.replace_backoff,
             )
 
         # Order matters, and which order is safe depends on direction — see the
@@ -131,7 +172,12 @@ class ParquetBackend:
 
     @staticmethod
     def _atomic_write(
-        target: Path, produce: Callable[[Path], None], *, fsync: bool = True
+        target: Path,
+        produce: Callable[[Path], None],
+        *,
+        fsync: bool = True,
+        attempts: int = DEFAULT_REPLACE_ATTEMPTS,
+        backoff: float = DEFAULT_REPLACE_BACKOFF,
     ) -> None:
         """Write via a sibling temp file, fsync, then rename over the target.
 
@@ -158,7 +204,9 @@ class ParquetBackend:
                 with open(tmp_path, "r+b") as written:
                     written.flush()
                     os.fsync(written.fileno())
-            ParquetBackend._replace(tmp_path, target)
+            ParquetBackend._replace(
+                tmp_path, target, attempts=attempts, backoff=backoff
+            )
             if fsync:
                 ParquetBackend._fsync_dir(target.parent)
         except BaseException:
@@ -172,25 +220,54 @@ class ParquetBackend:
             raise
 
     @staticmethod
-    def _replace(source: Path, target: Path) -> None:
-        """Atomically move ``source`` onto ``target``.
+    def _replace(
+        source: Path,
+        target: Path,
+        *,
+        attempts: int = DEFAULT_REPLACE_ATTEMPTS,
+        backoff: float = DEFAULT_REPLACE_BACKOFF,
+    ) -> None:
+        """Atomically move ``source`` onto ``target``, retrying transient locks.
 
         POSIX replaces an open file happily — the old inode survives until its
-        last handle closes. Windows refuses: a file with an open handle cannot
-        be replaced, and you get ``PermissionError``/``WinError 5``. Since that
-        is the difference that bites, say so rather than letting a bare
-        "Access is denied" reach the caller.
+        last handle closes — so the retry never engages there. Windows refuses
+        while anything holds the target open, and on a network or DFS share the
+        holder is often a service you don't control and that lets go a moment
+        later.
+
+        On exhaustion the error carries the attempt count and elapsed time,
+        because *which* it was matters: failing every attempt over 1.5s points
+        at a permanent holder or a permission problem, while succeeding on a
+        later attempt points at a transient one.
         """
-        try:
-            os.replace(source, target)
-        except PermissionError as error:  # pragma: no cover - Windows-specific
-            raise PermissionError(
-                f"could not move {source.name} onto {target.name}: {error}. "
-                "On Windows a file cannot be replaced while any handle to it is "
-                "open — check that nothing else (another process, an antivirus "
-                "scanner, or a lazy frame still holding the old file) has it "
-                "open."
-            ) from error
+        delay = backoff
+        started = time.monotonic()
+        last: OSError | None = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                os.replace(source, target)
+                return
+            except PermissionError as error:
+                # Covers both WinError 5 (access denied) and 32 (sharing
+                # violation); Python maps both onto PermissionError.
+                last = error
+                if attempt == attempts:
+                    break
+                time.sleep(delay)
+                delay *= 2
+
+        elapsed = time.monotonic() - started
+        raise PermissionError(
+            f"could not move {source.name} onto {target.name} after "
+            f"{attempts} attempt(s) over {elapsed:.1f}s: {last}. "
+            "On Windows a file cannot be replaced while anything holds it open. "
+            "Failing every attempt points at a permanent holder rather than a "
+            "transient one — a permission problem (replacing a file needs delete "
+            "rights on it, or delete-child on its directory), DFS Replication, "
+            "or another process with the file open. Raise replace_attempts if "
+            "the holder is slow rather than permanent."
+        ) from last
 
     @staticmethod
     def _fsync_dir(directory: Path) -> None:

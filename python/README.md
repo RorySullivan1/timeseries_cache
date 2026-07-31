@@ -178,6 +178,36 @@ Writes are dominated by rewriting the key's whole parquet file (~50ms per 2M
 rows, before compression choice). If that hurts, the answer is more keys — see
 below.
 
+## Network and DFS shares
+
+The cache stores a key by writing a temp file and renaming it over the old one.
+That is what makes a write atomic — but on Windows a file cannot be replaced
+while *anything* holds it open, and on a network or DFS share plenty of things
+transiently do: DFS Replication, the file server's indexer, antivirus, another
+client that just read the same key.
+
+The rename retries with backoff to ride those out:
+
+```python
+ParquetBackend(root, replace_attempts=5, replace_backoff=0.1)  # ~1.5s of trying
+```
+
+Raise `replace_attempts` if your share is slow to let go. If it fails on *every*
+attempt, the holder is permanent rather than transient — the error says so, and
+the usual causes are:
+
+- **No delete rights.** Replacing a file needs delete permission on it, or
+  delete-child on its directory. A share ACL'd "create and write, but not
+  delete" — a common corporate default — lets every step of a write succeed
+  except the rename, and blocks cleaning up the temp file too. No library
+  change can work around this; the directory needs Modify.
+- **Another writer.** See the single-writer limitation below. On a shared drive
+  that stops being hypothetical.
+
+**Prefer a local cache.** Beyond the locking, the read path leans on the
+filesystem for row-group skipping, and network latency undoes most of that.
+Cache locally, publish results to the share.
+
 ## Known limitations
 
 - **Single-writer.** A write is read-modify-write with no lock. Concurrent

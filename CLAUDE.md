@@ -188,7 +188,12 @@ most consumers here are pandas.
 Documented in `python/README.md` and deliberate — don't "fix" them without asking:
 
 - **Single-writer per key.** Writes are read-modify-write with no lock. Concurrent
-  writers to the same key can lose an update.
+  writers to the same key can lose an update. On a shared network drive that stops
+  being hypothetical — say so rather than assuming a caller has read this far.
+- **Network/DFS shares are second-class.** The atomic rename needs the target to be
+  unheld and deletable, and a share gives you neither reliably. `replace_attempts`
+  rides out transient holders (DFS Replication, indexers, antivirus); nothing
+  rescues a share ACL'd without delete rights, since a rename *is* a delete.
 - **Whole-key rewrite on write.** Reads scale (pushdown); writes scale with key size,
   not change size. The answer is more keys, not a rewrite of the storage model.
 - **Schema is fixed per key.** Adding or retyping a column is refused, not migrated.

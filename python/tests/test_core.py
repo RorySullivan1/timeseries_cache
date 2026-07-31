@@ -588,10 +588,10 @@ class TestAtomicity:
         class ManifestFailsBackend(ParquetBackend):
             armed = False
 
-            def _atomic_write(self, target, produce, *, fsync=True):  # type: ignore[override]
+            def _atomic_write(self, target, produce, **kwargs):  # type: ignore[override]
                 if self.armed and target.name == MANIFEST_NAME:
                     raise OSError("disk full")
-                ParquetBackend._atomic_write(target, produce, fsync=fsync)
+                ParquetBackend._atomic_write(target, produce, **kwargs)
 
         backend = ManifestFailsBackend(tmp_path / "cache")
         cache = TimeseriesCache(backend)
@@ -619,10 +619,10 @@ class TestAtomicity:
         class DataWriteFailsBackend(ParquetBackend):
             armed = False
 
-            def _atomic_write(self, target, produce, *, fsync=True):  # type: ignore[override]
+            def _atomic_write(self, target, produce, **kwargs):  # type: ignore[override]
                 if self.armed and target.name == DATA_NAME:
                     raise OSError("disk full")
-                ParquetBackend._atomic_write(target, produce, fsync=fsync)
+                ParquetBackend._atomic_write(target, produce, **kwargs)
 
         backend = DataWriteFailsBackend(tmp_path / "cache")
         cache = TimeseriesCache(backend)
@@ -777,6 +777,86 @@ class TestAtomicity:
 
         assert target.read_bytes() == b"payload"
         assert list(tmp_path.iterdir()) == [target], "a temp file was left behind"
+
+    def test_replace_retries_through_a_transient_lock(self, tmp_path, monkeypatch):
+        """The DFS / network-share case.
+
+        On Windows a file cannot be replaced while anything holds it open, and
+        on a network share the holder is often a service you don't control —
+        DFS Replication, the server's indexer, antivirus — that lets go a moment
+        later. A bounded retry turns that from a failed write into a pause.
+        """
+        from timeseries_cache.backends.parquet import ParquetBackend
+
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def flaky_replace(src, dst, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] < 3:  # held for the first two attempts, then released
+                raise PermissionError(32, "The process cannot access the file")
+            return real_replace(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(os, "replace", flaky_replace)
+        monkeypatch.setattr("time.sleep", lambda _seconds: None)  # no real waiting
+
+        target = tmp_path / "data.parquet"
+        ParquetBackend._atomic_write(target, lambda p: p.write_bytes(b"payload"))
+
+        assert calls["n"] == 3, "should have retried until the lock cleared"
+        assert target.read_bytes() == b"payload"
+        assert list(tmp_path.iterdir()) == [target], "a temp file was left behind"
+
+    def test_replace_gives_up_and_says_what_it_tried(self, tmp_path, monkeypatch):
+        """A permanent holder must still fail — quickly, and informatively.
+
+        Which it was matters: exhausting every attempt points at a permission
+        problem or a permanent holder, not a transient one, and the message has
+        to carry enough to tell them apart.
+        """
+        from timeseries_cache.backends.parquet import ParquetBackend
+
+        def always_denied(src, dst, *args, **kwargs):
+            raise PermissionError(5, "Access is denied")
+
+        monkeypatch.setattr(os, "replace", always_denied)
+        monkeypatch.setattr("time.sleep", lambda _seconds: None)
+
+        target = tmp_path / "data.parquet"
+        with pytest.raises(PermissionError) as caught:
+            ParquetBackend._atomic_write(
+                target, lambda p: p.write_bytes(b"payload"), attempts=3
+            )
+
+        message = str(caught.value)
+        assert "3 attempt(s)" in message
+        assert "delete rights" in message, "should name the permission cause"
+        assert "Access is denied" in message, "should keep the underlying error"
+        assert caught.value.__cause__ is not None, "original error must be chained"
+        assert not list(tmp_path.iterdir()), "the temp file must still be cleaned up"
+
+    def test_a_single_attempt_does_not_retry(self, tmp_path, monkeypatch):
+        from timeseries_cache.backends.parquet import ParquetBackend
+
+        calls = {"n": 0}
+
+        def always_denied(src, dst, *args, **kwargs):
+            calls["n"] += 1
+            raise PermissionError(5, "Access is denied")
+
+        monkeypatch.setattr(os, "replace", always_denied)
+        target = tmp_path / "data.parquet"
+        with pytest.raises(PermissionError):
+            ParquetBackend._atomic_write(
+                target, lambda p: p.write_bytes(b"x"), attempts=1
+            )
+        assert calls["n"] == 1
+
+    def test_replace_attempts_must_be_positive(self, tmp_path):
+        from timeseries_cache.backends.parquet import ParquetBackend
+
+        with pytest.raises(ValueError, match="at least 1"):
+            ParquetBackend(tmp_path, replace_attempts=0)
 
     def test_atomic_write_cleans_up_after_a_failure(self, tmp_path):
         from timeseries_cache.backends.parquet import ParquetBackend
