@@ -102,6 +102,71 @@ class TestRoundTrip:
         assert result.is_complete
 
 
+class TestIdentityColumns:
+    """Trade-shaped data: a repeating DatetimeIndex disambiguated by a column."""
+
+    @pytest.fixture
+    def tcache(self, backend) -> PandasTimeseriesCache:
+        return PandasTimeseriesCache(backend, identity_columns=("trade_id",))
+
+    @staticmethod
+    def tframe(rows: list[tuple[int, str, float]]) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "trade_id": [tid for _, tid, _ in rows],
+                "price": [price for _, _, price in rows],
+            },
+            index=pd.DatetimeIndex(
+                [ts(day) for day, _, _ in rows], tz="UTC", name="ts"
+            ),
+        )
+
+    def test_a_repeating_index_round_trips(self, tcache: PandasTimeseriesCache):
+        original = self.tframe([(1, "a", 10.0), (1, "b", 11.0), (2, "c", 12.0)])
+        assert not original.index.is_unique  # the point
+        tcache.write(original, **SERIES)
+        assert_frame_equal(tcache.read(**SERIES).frame, original)
+
+    def test_index_stays_the_timestamp_not_a_multiindex(
+        self, tcache: PandasTimeseriesCache
+    ):
+        tcache.write(self.tframe([(1, "a", 10.0), (1, "b", 11.0)]), **SERIES)
+        frame = tcache.read(**SERIES).frame
+        assert isinstance(frame.index, pd.DatetimeIndex)
+        assert "trade_id" in frame.columns
+
+    def test_upsert_replaces_only_the_matching_trade(
+        self, tcache: PandasTimeseriesCache
+    ):
+        tcache.write(
+            self.tframe([(1, "a", 10.0), (1, "b", 11.0), (1, "c", 12.0)]), **SERIES
+        )
+        tcache.write(self.tframe([(1, "b", 99.0)]), start=ts(1), end=ts(1), **SERIES)
+        frame = tcache.read(**SERIES).frame
+        assert frame["trade_id"].tolist() == ["a", "b", "c"]
+        assert frame["price"].tolist() == [10.0, 99.0, 12.0]
+
+    def test_duplicate_identity_is_still_rejected(self, tcache: PandasTimeseriesCache):
+        with pytest.raises(IndexContractError, match="repeat the identity"):
+            tcache.write(self.tframe([(1, "a", 1.0), (1, "a", 2.0)]), **SERIES)
+
+    def test_multiindex_error_points_at_identity_columns(
+        self, tcache: PandasTimeseriesCache
+    ):
+        multi = pd.DataFrame(
+            {"price": [1.0]},
+            index=pd.MultiIndex.from_tuples([(ts(1), "a")], names=["ts", "trade_id"]),
+        )
+        with pytest.raises(IndexContractError, match="identity_columns"):
+            tcache.write(multi, **SERIES)
+
+    def test_a_plain_cache_still_rejects_repeating_timestamps(
+        self, pcache: PandasTimeseriesCache
+    ):
+        with pytest.raises(IndexContractError, match="duplicate timestamp"):
+            pcache.write(pframe([1, 1]), **SERIES)
+
+
 class TestBoundaryRejections:
     def test_rejects_a_naive_index(self, pcache: PandasTimeseriesCache):
         naive = pd.DataFrame(

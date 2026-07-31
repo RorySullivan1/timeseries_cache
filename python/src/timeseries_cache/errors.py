@@ -32,6 +32,15 @@ class IndexContractError(TimeseriesCacheError):
     """
 
 
+class InvalidIdentityError(TimeseriesCacheError):
+    """``identity_columns`` is malformed, or disagrees with what a key holds.
+
+    A key remembers the identity it was written with, so reading trade data
+    keyed on ``(ts, trade_id)`` through a cache configured for ``ts`` alone is
+    an error rather than a silently different notion of "the same row".
+    """
+
+
 class SchemaMismatchError(TimeseriesCacheError):
     """An incoming frame's schema disagrees with what the key already holds."""
 

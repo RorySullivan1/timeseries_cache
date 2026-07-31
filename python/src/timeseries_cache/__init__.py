@@ -18,6 +18,7 @@ Both are addressed by arbitrary keyword arguments::
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from .backends import MemoryBackend, ParquetBackend, StorageBackend
@@ -31,6 +32,7 @@ from .core import (
 from .errors import (
     CacheKeyCollisionError,
     IndexContractError,
+    InvalidIdentityError,
     InvalidKwargError,
     OverlappingWriteError,
     SchemaMismatchError,
@@ -55,6 +57,7 @@ __all__ = [
     "IndexContractError",
     "Interval",
     "IntervalSet",
+    "InvalidIdentityError",
     "InvalidKwargError",
     "Manifest",
     "MemoryBackend",
@@ -78,25 +81,33 @@ def open_cache(
     root: str | os.PathLike[str],
     *,
     timestamp_column: str = DEFAULT_TIMESTAMP_COLUMN,
+    identity_columns: Sequence[str] = (),
 ) -> TimeseriesCache:
     """Open a parquet-backed cache rooted at ``root``.
 
     The convenience wiring lives here rather than in ``core`` so the coverage
     logic never imports a concrete backend.
     """
-    return TimeseriesCache(ParquetBackend(root), timestamp_column=timestamp_column)
+    return TimeseriesCache(
+        ParquetBackend(root),
+        timestamp_column=timestamp_column,
+        identity_columns=identity_columns,
+    )
 
 
 def open_pandas_cache(
     root: str | os.PathLike[str],
     *,
     timestamp_column: str = DEFAULT_TIMESTAMP_COLUMN,
+    identity_columns: Sequence[str] = (),
 ) -> PandasTimeseriesCache:
     """Open a parquet-backed cache with the pandas facade."""
     from .pandas import PandasTimeseriesCache
 
     return PandasTimeseriesCache(
-        ParquetBackend(root), timestamp_column=timestamp_column
+        ParquetBackend(root),
+        timestamp_column=timestamp_column,
+        identity_columns=identity_columns,
     )
 
 
