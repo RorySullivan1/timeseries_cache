@@ -52,9 +52,17 @@ unique id is supplied, *and* that composite is what identifies data to overwrite
   one leaves the other two alone; `replace_window` drops a busted trade without
   reopening the range.
 
+## Outcome
+- CI went green on 3.11/3.12/3.13 against head `73f7015`; PR #2 squash-merged as
+  `705fe3b`. Verified merged main: 314 tests, ruff + mypy clean. Unsubscribed and
+  cancelled the hourly check-in.
+- Note for future PR checks: `pull_request_read(get_status)` reports "pending" with
+  `total_count: 0` because that's the *legacy commit-status* API and this repo uses
+  **check runs**. Read `get_check_runs` plus `mergeable_state` instead — mistaking
+  the empty legacy status for a real pending check would block merges forever.
+
 ## Open threads
-- PR #2 not merged yet.
-- Old branch `claude/timeseries-cache-template-pq0v1e` still needs deleting in the
-  GitHub UI (403 from this environment's git proxy).
+- Both merged branches still exist on origin; deletion 403s from this environment,
+  so it needs the GitHub UI.
 - Identity is fixed per key, like schema — no in-place migration path. Documented as
   a limitation rather than solved.
