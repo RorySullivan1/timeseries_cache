@@ -74,6 +74,11 @@ class PandasTimeseriesCache:
         return self._cache.identity_columns
 
     @property
+    def row_key(self) -> tuple[str, ...]:
+        """The columns identifying a row: the timestamp plus identity columns."""
+        return self._cache.row_key
+
+    @property
     def backend(self) -> StorageBackend:
         return self._cache.backend
 

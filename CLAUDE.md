@@ -20,6 +20,7 @@ self-contained implementation of the same contract, with its own build config.
 
 ```
 python/
+  tutorials/       # markdown walkthroughs; their code blocks are executed by tests
   src/timeseries_cache/
     core.py        # TimeseriesCache: read / write / delete / coverage (polars in, polars out)
     pandas.py      # PandasTimeseriesCache: the same API, pandas in, pandas out
@@ -240,6 +241,21 @@ numpy-backed.
 The `backend` fixture in `tests/conftest.py` is parametrized over memory and parquet,
 so every behavioral test already runs twice; write tests against the fixture rather
 than constructing a backend directly, unless the test is *about* one backend.
+
+The tutorials in `tutorials/` are **markdown, and their code is executed**.
+`tests/test_tutorials.py` extracts every ` ```python ` block from each page,
+concatenates them in document order, and runs the result — so an API change that
+breaks an example breaks the build. Two conventions follow and must be kept: blocks
+build on each other into one runnable script, and claims the prose makes are spelled
+as `assert`s, so the test checks the narrative rather than merely that nothing
+raised. Blocks fenced ` ```py ` or ` ```text ` are skipped, for snippets quoted from
+elsewhere in the repo.
+
+Discovery is by glob, so a new page is covered automatically; it also needs a row in
+`tutorials/README.md`, and its inter-page links must resolve — both asserted. `ruff
+format` reaches inside the fences, so tutorial code is style-checked too. When you
+change public API, expect to update the tutorials alongside the tests; prose that
+still reads plausibly but no longer runs is worse than no example.
 
 ## Capabilities
 

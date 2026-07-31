@@ -497,6 +497,13 @@ class TimeseriesCache:
             self._check_schema(stored, incoming)
 
         merged = self._merge(existing, incoming, window, mode, schemaless_empty)
+        # Drop the scan before handing anything to the backend. `merged` is
+        # already materialized, so nothing below needs it — but on Windows a
+        # file cannot be replaced while a handle to it is open, and this scan
+        # points at the very file the backend is about to move the new one onto.
+        # POSIX doesn't care (the old inode survives its last handle), which is
+        # exactly why leaving it alive looks harmless on Linux and fails there.
+        del existing
 
         base = manifest or Manifest.new(
             key,
