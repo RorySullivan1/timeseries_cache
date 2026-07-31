@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
@@ -637,6 +638,45 @@ class TestAtomicity:
         # "covered and empty" — it has to come back as unknown so it refetches.
         assert result.missing.intervals == (Interval(ts(2), ts(3)),)
         assert not result.is_complete
+
+    def test_fsync_receives_a_writable_descriptor(self, tmp_path, monkeypatch):
+        """Portability guard, not a behavior check.
+
+        POSIX permits fsync on a read-only descriptor, so a read-only open here
+        passes on Linux and macOS and then fails on Windows, where os.fsync is
+        _commit() and rejects a read-only CRT handle with EBADF — surfacing as
+        "Bad file descriptor". Nothing on this platform reproduces that, so the
+        invariant is asserted directly instead.
+        """
+        fcntl = pytest.importorskip(
+            "fcntl", reason="access-mode introspection is POSIX-only"
+        )
+        import stat
+
+        from timeseries_cache.backends.parquet import ParquetBackend
+
+        modes: list[int] = []
+        real_fsync = os.fsync
+
+        def recording_fsync(fd: int) -> None:
+            # Only the *file* descriptor is in scope. The directory fsync is
+            # necessarily read-only — a directory cannot be opened for writing —
+            # which is exactly why `_fsync_dir` treats it as best-effort.
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                modes.append(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE)
+            real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", recording_fsync)
+
+        target = tmp_path / "data.parquet"
+        ParquetBackend._atomic_write(target, lambda p: p.write_bytes(b"payload"))
+
+        assert modes, "fsync was never called on the file"
+        assert all(mode in (os.O_WRONLY, os.O_RDWR) for mode in modes), (
+            f"fsync got a read-only descriptor (access modes {modes}); "
+            "this raises EBADF on Windows"
+        )
+        assert target.read_bytes() == b"payload"
 
     def test_atomic_write_cleans_up_after_a_failure(self, tmp_path):
         from timeseries_cache.backends.parquet import ParquetBackend

@@ -148,7 +148,14 @@ class ParquetBackend:
         try:
             produce(tmp_path)
             if fsync:
-                with open(tmp_path, "rb") as written:
+                # "r+b", not "rb": the descriptor handed to fsync must be
+                # *writable*. POSIX permits fsync on a read-only descriptor, but
+                # on Windows os.fsync is _commit(), which rejects a read-only
+                # CRT handle with EBADF — "Bad file descriptor" — so a read-only
+                # open here works everywhere except the platform most likely to
+                # be running it. r+b also avoids truncating what produce wrote.
+                with open(tmp_path, "r+b") as written:
+                    written.flush()
                     os.fsync(written.fileno())
             os.replace(tmp_path, target)
             if fsync:
