@@ -158,12 +158,39 @@ class ParquetBackend:
                 with open(tmp_path, "r+b") as written:
                     written.flush()
                     os.fsync(written.fileno())
-            os.replace(tmp_path, target)
+            ParquetBackend._replace(tmp_path, target)
             if fsync:
                 ParquetBackend._fsync_dir(target.parent)
         except BaseException:
-            tmp_path.unlink(missing_ok=True)
+            # Suppressed: on Windows, unlinking a file that still has an open
+            # handle raises PermissionError, and an exception raised *inside* an
+            # except block replaces the one being handled. Without this, a
+            # failed cleanup hides whatever actually went wrong — you get
+            # "permission denied" on a temp file instead of the real cause.
+            with contextlib.suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
             raise
+
+    @staticmethod
+    def _replace(source: Path, target: Path) -> None:
+        """Atomically move ``source`` onto ``target``.
+
+        POSIX replaces an open file happily — the old inode survives until its
+        last handle closes. Windows refuses: a file with an open handle cannot
+        be replaced, and you get ``PermissionError``/``WinError 5``. Since that
+        is the difference that bites, say so rather than letting a bare
+        "Access is denied" reach the caller.
+        """
+        try:
+            os.replace(source, target)
+        except PermissionError as error:  # pragma: no cover - Windows-specific
+            raise PermissionError(
+                f"could not move {source.name} onto {target.name}: {error}. "
+                "On Windows a file cannot be replaced while any handle to it is "
+                "open — check that nothing else (another process, an antivirus "
+                "scanner, or a lazy frame still holding the old file) has it "
+                "open."
+            ) from error
 
     @staticmethod
     def _fsync_dir(directory: Path) -> None:

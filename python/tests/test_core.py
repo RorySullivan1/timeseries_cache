@@ -678,6 +678,49 @@ class TestAtomicity:
         )
         assert target.read_bytes() == b"payload"
 
+    def test_the_scan_is_released_before_the_backend_writes(self, tmp_path):
+        """Windows cannot replace a file while a handle to it is open.
+
+        `write()` scans the key's existing parquet to merge against, then hands
+        the result to the backend, which moves a new file onto that same path.
+        If the scan is still alive at that moment, the replace fails with
+        PermissionError on Windows. POSIX allows it — the old inode survives its
+        last handle — which is exactly why this needs asserting rather than
+        observing: nothing here would ever fail on the machine CI runs on.
+
+        Checked with a weak reference, so it holds on any platform.
+        """
+        import gc
+        import weakref
+
+        from timeseries_cache.backends.parquet import ParquetBackend
+
+        scanned: list[weakref.ref] = []
+        alive_at_write: list[bool] = []
+
+        class WatchfulBackend(ParquetBackend):
+            def scan(self, key):  # type: ignore[no-untyped-def]
+                lazy = super().scan(key)
+                if lazy is not None:
+                    scanned.append(weakref.ref(lazy))
+                return lazy
+
+            def write(self, key, frame, manifest, *, manifest_first=False):  # type: ignore[no-untyped-def]
+                gc.collect()
+                alive_at_write.append(any(ref() is not None for ref in scanned))
+                super().write(key, frame, manifest, manifest_first=manifest_first)
+
+        cache = TimeseriesCache(WatchfulBackend(tmp_path / "cache"))
+        cache.write(frame([1, 2]), **SERIES)  # first write: nothing to scan
+        cache.write(frame([3, 4]), **SERIES)  # second: merges against the file
+
+        assert scanned, "the second write should have scanned the existing file"
+        assert not any(alive_at_write), (
+            "a LazyFrame over the target file was still alive when the backend "
+            "replaced it; this raises PermissionError on Windows"
+        )
+        assert days(cache.read(**SERIES)) == [ts(1), ts(2), ts(3), ts(4)]
+
     @pytest.mark.parametrize("failing", ["open", "fsync", "close"])
     def test_directory_fsync_never_breaks_a_write(
         self, tmp_path, monkeypatch, failing: str
