@@ -1,8 +1,8 @@
 # MEMORY INDEX  ·  keep ≤ ~80 lines
 
 ## State            (rewrite in place — current truth only, ≤ ~10 lines)
-- `python/` is complete: 335 tests green, ruff + `mypy --strict` clean on 3.11/3.12/3.13. No other language port.
-- PRs #1 and #2 merged; main = `193b392`. PR #3 open on `claude/tutorials` (runnable examples).
+- `python/` is complete: 340 tests green, ruff + `mypy --strict` clean on 3.11/3.12/3.13. No other language port.
+- PRs #1-#3 all merged; main = `4612191`. No branch in flight. Tutorials are markdown under `python/tutorials/`.
 - Row identity is `(timestamp, *identity_columns)`; default `()` = timestamp alone, unchanged behavior.
 - Remote branch deletion returns 403 from this environment's git proxy — must be done in the GitHub UI.
 - CLAUDE.md now describes shipped code, not a plan. All five invariants are implemented.
@@ -33,10 +33,14 @@
 - [2026-07-31] The manifest records `identity_columns` and refuses a mismatch either way; missing field reads as timestamp-only, so no FORMAT_VERSION bump was needed. — sessions/2026-07-31-2021-composite-row-identity.md
 - [2026-07-31] Tutorials are markdown, superseding the first pass as runnable scripts. `tests/test_tutorials.py` extracts each ```python block, concatenates in document order and executes it, so examples can't rot. Prose claims are written as `assert`s so the test validates the narrative. — sessions/2026-07-31-2037-tutorials.md
 - [2026-07-31] `ruff format` formats Python inside markdown fences, so tutorial code is style-checked by the existing format gate — markdown is not outside the linter's reach. — sessions/2026-07-31-2037-tutorials.md
+- [2026-07-31] **POSIX lets you replace/unlink an open file; Windows does not.** `write()` must release its lazy scan before the backend replaces that file, or every write after the first fails on Windows. Tested with a weakref so it holds on any platform. — sessions/2026-07-31-2123-windows-portability.md
+- [2026-07-31] Cleanup in an `except` block must be `contextlib.suppress`ed: an exception raised there *replaces* the one being handled, so a failed unlink hid the real error and made the reported fault appear to move. — sessions/2026-07-31-2123-windows-portability.md
+- [2026-07-31] `os.fsync` needs a *writable* descriptor (`r+b`): POSIX permits read-only, Windows `_commit()` rejects it with EBADF. The directory fsync is best-effort and guards all three of its syscalls, including the close. — sessions/2026-07-31-2123-windows-portability.md
 
 ## Threads          (open items; remove when closed)
 - Hooks invoke `python`, not `python3`; will silently no-op on a `python3`-only machine.
-- PR #3 (tutorials) not merged. Merged branches still on origin — deletion 403s from here, needs the GitHub UI.
+- **CI is ubuntu-only and has missed three Windows bugs.** Adding `windows-latest` is the open fix.
+- All three merged branches still on origin — deletion 403s from here, needs the GitHub UI.
 - Interval algebra + cache semantics were fuzzed once by hand and came back clean; worth wiring in as property tests rather than a one-off.
 - No second language port; the backend protocol + manifest JSON are the intended seam.
 - Accepted (not bugs): single-writer per key, whole-key rewrite per write, schema and identity fixed per key.
@@ -48,3 +52,4 @@
 - 2026-07-31 2012 | merge PR #1 to main; CI workflow on PR #2 | sessions/2026-07-31-2012-merge-and-ci.md
 - 2026-07-31 2021 | composite row identity for repeating timestamps | sessions/2026-07-31-2021-composite-row-identity.md
 - 2026-07-31 2037 | runnable tutorials, tested in CI | sessions/2026-07-31-2037-tutorials.md
+- 2026-07-31 2123 | Windows portability: open-file replace, masked errors, fsync descriptors | sessions/2026-07-31-2123-windows-portability.md
