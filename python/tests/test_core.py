@@ -365,6 +365,20 @@ class TestRead:
         with pytest.raises(SchemaMismatchError, match="unknown column"):
             cache.read(columns=["nope"], **SERIES)
 
+    def test_unknown_column_is_caught_even_with_no_data_file(
+        self, cache: TimeseriesCache
+    ):
+        """A key covered only by empty writes still knows its schema.
+
+        Skipping validation here would let a typo sit silent until the day real
+        rows arrive.
+        """
+        cache.write(frame([1]), **SERIES)
+        cache.delete(start=ts(1), end=ts(1), **SERIES)
+        cache.write(pl.DataFrame(), start=ts(5), end=ts(6), **SERIES)
+        with pytest.raises(SchemaMismatchError, match="unknown column"):
+            cache.read(columns=["nope"], **SERIES)
+
     def test_start_beyond_all_coverage_returns_empty_and_unknown(
         self, cache: TimeseriesCache
     ):
@@ -573,10 +587,10 @@ class TestAtomicity:
         class ManifestFailsBackend(ParquetBackend):
             armed = False
 
-            def _atomic_write(self, target, produce):  # type: ignore[override]
+            def _atomic_write(self, target, produce, *, fsync=True):  # type: ignore[override]
                 if self.armed and target.name == MANIFEST_NAME:
                     raise OSError("disk full")
-                ParquetBackend._atomic_write(target, produce)
+                ParquetBackend._atomic_write(target, produce, fsync=fsync)
 
         backend = ManifestFailsBackend(tmp_path / "cache")
         cache = TimeseriesCache(backend)
@@ -590,6 +604,39 @@ class TestAtomicity:
         coverage = cache.coverage(**SERIES)
         assert coverage.intervals == (Interval(ts(1), ts(2)),)
         assert cache.read(start=ts(1), end=ts(6), **SERIES).missing
+
+    def test_interrupted_delete_never_leaves_a_silent_hole(self, tmp_path):
+        """A delete *shrinks* what the manifest claims, so the usual data-first
+        order is the wrong way round.
+
+        Data-first, interrupted, would leave coverage claiming a range whose rows
+        are gone — and a read of it would answer "covered, and genuinely empty",
+        which is exactly the lie invariant 5 exists to prevent.
+        """
+        from timeseries_cache.backends.parquet import DATA_NAME, ParquetBackend
+
+        class DataWriteFailsBackend(ParquetBackend):
+            armed = False
+
+            def _atomic_write(self, target, produce, *, fsync=True):  # type: ignore[override]
+                if self.armed and target.name == DATA_NAME:
+                    raise OSError("disk full")
+                ParquetBackend._atomic_write(target, produce, fsync=fsync)
+
+        backend = DataWriteFailsBackend(tmp_path / "cache")
+        cache = TimeseriesCache(backend)
+        cache.write(frame([1, 2, 3, 4, 5]), **SERIES)
+
+        backend.armed = True
+        with pytest.raises(OSError):
+            cache.delete(start=ts(2), end=ts(3), **SERIES)
+
+        backend.armed = False
+        result = cache.read(start=ts(1), end=ts(5), **SERIES)
+        # The rows may or may not be gone, but the range must NOT read as
+        # "covered and empty" — it has to come back as unknown so it refetches.
+        assert result.missing.intervals == (Interval(ts(2), ts(3)),)
+        assert not result.is_complete
 
     def test_atomic_write_cleans_up_after_a_failure(self, tmp_path):
         from timeseries_cache.backends.parquet import ParquetBackend

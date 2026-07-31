@@ -67,9 +67,19 @@ class PandasTimeseriesCache:
 
     def _to_polars(self, frame: pd.DataFrame) -> pl.DataFrame:
         column = self.timestamp_column
-        if frame.empty and frame.index.nlevels == 1 and frame.columns.empty:
+        # Both halves matter. `DataFrame.empty` is True whenever there are no
+        # *columns*, even with a fully populated index — so testing it alone
+        # would read a frame of bare timestamps as "upstream had nothing" and
+        # drop every one of them while still claiming the window as covered.
+        if frame.columns.empty and len(frame.index) == 0:
             # The "fetched, and upstream had nothing" case — no schema to carry.
             return pl.DataFrame()
+
+        if duplicated := frame.columns[frame.columns.duplicated()].tolist():
+            raise IndexContractError(
+                f"frame has duplicate column name(s) {sorted(set(duplicated))}; "
+                "rename them before writing"
+            )
 
         if isinstance(frame.index, pd.MultiIndex):
             raise IndexContractError(
@@ -94,7 +104,15 @@ class PandasTimeseriesCache:
         else:
             self._reject_submicrosecond(frame[column].dtype, frame[column])
 
-        return pl.from_pandas(frame)
+        try:
+            return pl.from_pandas(frame)
+        except Exception as error:
+            # Anything polars raises here is about the caller's frame, and a
+            # polars traceback escaping would break the facade's promise that
+            # its callers never see one.
+            raise IndexContractError(
+                f"frame could not be converted for storage: {error}"
+            ) from error
 
     @staticmethod
     def _reject_submicrosecond(dtype: Any, values: Any) -> None:
@@ -117,8 +135,13 @@ class PandasTimeseriesCache:
     def _to_pandas(self, frame: pl.DataFrame) -> pd.DataFrame:
         column = self.timestamp_column
         if frame.width == 0:
-            empty = pd.DataFrame(index=pd.DatetimeIndex([], tz="UTC", name=column))
-            return empty
+            # Spell the unit out: an undated `DatetimeIndex([])` resolves to
+            # second resolution, so an empty read would come back with a
+            # different index dtype from a non-empty one and refuse to line up
+            # on concat or comparison.
+            return pd.DataFrame(
+                index=pd.DatetimeIndex([], dtype="datetime64[us, UTC]", name=column)
+            )
         # numpy-backed on purpose: arrow-backed pandas has different null
         # semantics from np.nan, which silently changes how downstream
         # pct_change / rolling / dropna behave.

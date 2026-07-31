@@ -5,9 +5,19 @@ bytes. Adding object storage, or porting the cache to another language, should
 mean writing one of these — not touching ``core``.
 
 Backends own **atomicity** (invariant 5). ``write`` receives the data and the
-manifest together so a single implementation can guarantee the ordering: data
-lands first, the manifest last. A crash between them leaves rows on disk that
-nothing claims, which costs a refetch; the reverse would serve a silent hole.
+manifest together so a single implementation can guarantee the ordering, and the
+safe order depends on which direction the update moves:
+
+* **Growing** (the usual case — new rows, wider coverage): data first, manifest
+  last. A crash between them leaves rows on disk that nothing claims, costing a
+  refetch.
+* **Shrinking** (``delete``, which removes rows *and* their coverage): manifest
+  first, data last. The reverse would leave the manifest claiming a range whose
+  rows are already gone — a read would then report "covered, and genuinely
+  empty", which is precisely the silent hole invariant 5 exists to prevent.
+
+Either way the interruptible middle state *under-claims*, so the cost of a crash
+is always an unnecessary refetch rather than wrong data.
 """
 
 from __future__ import annotations
@@ -40,8 +50,19 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def write(self, key: CacheKey, frame: pl.DataFrame, manifest: Manifest) -> None:
-        """Persist rows and manifest atomically, manifest last."""
+    def write(
+        self,
+        key: CacheKey,
+        frame: pl.DataFrame,
+        manifest: Manifest,
+        *,
+        manifest_first: bool = False,
+    ) -> None:
+        """Persist rows and manifest, ordered so a crash under-claims.
+
+        Set ``manifest_first`` when the update *reduces* what the manifest
+        claims; see the module docstring for why the order has to flip.
+        """
         ...
 
     def delete(self, key: CacheKey) -> None:

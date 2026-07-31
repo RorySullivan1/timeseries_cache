@@ -81,9 +81,31 @@ class TestTypeTagging:
     def test_list_and_tuple_agree(self):
         assert digest(cols=["a", "b"]) == digest(cols=("a", "b"))
 
-    def test_nested_separator_is_not_forgeable(self):
-        # A naive "join with &" scheme would let a value impersonate a kwarg.
-        assert digest(a="1&b=2") != digest(a="1", b="2")
+    def test_a_value_cannot_impersonate_another_kwarg(self):
+        """The separator-injection hole.
+
+        Any scheme that concatenates ``name=taggedvalue`` with a separator lets
+        a string value containing the separator *and* a type tag forge extra
+        kwargs — producing an identical canonical string, so even the manifest's
+        collision check can't catch it, and one series silently serves another's
+        rows.
+        """
+        forged = {"a": "x&b=s:y"}
+        target = {"a": "x", "b": "y"}
+        assert canonicalize(forged) != canonicalize(target)
+        assert digest(**forged) != digest(**target)
+
+    def test_separator_injection_inside_a_list(self):
+        assert digest(cols=["a,b"]) != digest(cols=["a", "b"])
+
+    def test_json_metacharacters_in_values_are_escaped(self):
+        for hostile in ('{"b": ["s", "y"]}', '","', "\\", '"', "[]"):
+            assert digest(a=hostile) != digest(a="", b="")
+            # and round-trips to a distinct, stable key
+            assert digest(a=hostile) == digest(a=hostile)
+
+    def test_a_kwarg_name_cannot_impersonate_structure(self):
+        assert digest(**{'a":["s","x"],"b': "y"}) != digest(a="x", b="y")
 
 
 class TestSupportedTypes:

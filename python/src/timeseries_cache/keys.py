@@ -13,6 +13,7 @@ insertion order, ``repr`` of arbitrary objects, and locale-dependent formatting.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -31,21 +32,26 @@ kwargs. Using one raises rather than silently shadowing it."""
 _HASH_LENGTH: Final[int] = 32
 
 
-def _canonical_value(value: Any, *, path: str) -> str:
-    """Render a single kwarg value as a deterministic, type-tagged string.
+def _canonical_value(value: Any, *, path: str) -> list[Any]:
+    """Render a kwarg value as a deterministic ``[tag, payload]`` pair.
 
     The type tag is load-bearing: without it the int ``1`` and the string
     ``"1"`` would hash to the same key and quietly share a cache entry.
+
+    A *structure* rather than a string, because string concatenation with
+    separators is forgeable — a value containing the separator characters can
+    impersonate additional kwargs. JSON encoding at the end escapes everything
+    exactly once, so no value can break out of its own slot.
     """
     if isinstance(value, Enum):
         return _canonical_value(value.value, path=path)
     if value is None:
-        return "n:"
-    # bool before int: bool is an int subclass, and True would render as "i:1".
+        return ["n", None]
+    # bool before int: bool is an int subclass, and True would render as 1.
     if isinstance(value, bool):
-        return f"b:{'true' if value else 'false'}"
+        return ["b", value]
     if isinstance(value, int):
-        return f"i:{value:d}"
+        return ["i", f"{value:d}"]
     if isinstance(value, float):
         if value != value or value in (float("inf"), float("-inf")):
             raise InvalidKwargError(
@@ -53,21 +59,24 @@ def _canonical_value(value: Any, *, path: str) -> str:
                 "stable identity and cannot key a cache entry"
             )
         # repr round-trips exactly for float and is locale-independent.
-        return f"f:{value!r}"
+        return ["f", repr(value)]
     if isinstance(value, str):
-        return f"s:{value}"
+        return ["s", value]
     if isinstance(value, Decimal):
         # Textual identity: Decimal("1.0") and Decimal("1") are *different* keys.
-        return f"dec:{value}"
+        return ["dec", str(value)]
     if isinstance(value, datetime):
-        return f"dt:{ensure_utc(value, label=f'cache kwarg {path!r}').isoformat()}"
+        return ["dt", ensure_utc(value, label=f"cache kwarg {path!r}").isoformat()]
     if isinstance(value, date):
-        return f"d:{value.isoformat()}"
+        return ["d", value.isoformat()]
     if isinstance(value, (list, tuple)):
-        inner = ",".join(
-            _canonical_value(item, path=f"{path}[{i}]") for i, item in enumerate(value)
-        )
-        return f"l:[{inner}]"
+        return [
+            "l",
+            [
+                _canonical_value(item, path=f"{path}[{i}]")
+                for i, item in enumerate(value)
+            ],
+        ]
     if isinstance(value, (set, frozenset)):
         raise InvalidKwargError(
             f"cache kwarg {path!r} is a {type(value).__name__}; sets have no "
@@ -88,7 +97,11 @@ def _canonical_value(value: Any, *, path: str) -> str:
 def canonicalize(kwargs: dict[str, Any]) -> str:
     """Render the whole kwargs mapping as one deterministic string.
 
-    Keys are sorted, so call-site keyword order is irrelevant.
+    Keys are sorted, so call-site keyword order is irrelevant. The result is
+    JSON with sorted keys and no insignificant whitespace: unambiguous to parse
+    back, and — the point — impossible for a value to forge, since every string
+    is escaped inside its own slot rather than concatenated with separators.
+    ``ensure_ascii`` keeps the bytes identical regardless of platform encoding.
     """
     for name in sorted(kwargs):
         if name in RESERVED_KWARGS:
@@ -98,10 +111,8 @@ def canonicalize(kwargs: dict[str, Any]) -> str:
             )
         if not name:
             raise InvalidKwargError("cache kwarg names must be non-empty")
-    parts = [
-        f"{name}={_canonical_value(kwargs[name], path=name)}" for name in sorted(kwargs)
-    ]
-    return "&".join(parts)
+    tagged = {name: _canonical_value(kwargs[name], path=name) for name in kwargs}
+    return json.dumps(tagged, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
 @dataclass(frozen=True)

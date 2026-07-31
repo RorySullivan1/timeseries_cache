@@ -75,9 +75,12 @@ cache.write(corrected, start=t0, end=t1, mode="replace_window", **series)
   `int`, `float`, `bool`, `None`, `date`, `datetime`, `Decimal`, `Enum`, and
   lists/tuples of those. `start`, `end`, `mode`, `columns`, and `frame` are
   reserved for control parameters.
-- A write lands completely or not at all: data first, manifest last. An
-  interrupted write may leave rows nothing claims (costing a refetch); it will
-  not leave coverage claiming rows that aren't there.
+- A write lands completely or not at all. Growing updates write data first and
+  the manifest last; `delete`, which *shrinks* what is claimed, writes the
+  manifest first. Either way an interruption leaves the cache under-claiming, so
+  the cost is a refetch — never coverage claiming rows that aren't there.
+- Cache kwargs canonicalize to JSON before hashing, so no value can forge its
+  way into another kwarg's slot no matter what characters it contains.
 
 ## Layout
 
@@ -89,6 +92,47 @@ cache.write(corrected, start=t0, end=t1, mode="replace_window", **series)
 The manifest keeps the kwargs verbatim, so a cache directory is self-describing
 and a digest collision surfaces as an error rather than one series quietly
 serving another's rows.
+
+## Tuning
+
+The defaults suit a cache written once and read often. All three knobs are on
+the backend:
+
+```python
+from timeseries_cache import TimeseriesCache
+from timeseries_cache.backends import ParquetBackend
+
+backend = ParquetBackend(
+    root,
+    row_group_size=64_000,  # the unit the reader can skip
+    compression="zstd",  # or "lz4": ~30% faster writes, ~2.7x bigger files
+    fsync=True,  # see the durability note below
+)
+cache = TimeseriesCache(backend)
+```
+
+**`row_group_size` is the one that matters.** Every read here is a time range,
+and row groups are what the parquet reader can skip, so finer groups mean less
+over-reading. Measured against a 2M-row key:
+
+| | polars default | 64k (this default) |
+|---|---|---|
+| read 1,000-row window | ~6.0ms | ~4.4ms |
+| read 50,000-row window | ~6.0ms | ~4.4ms |
+| read 500,000-row window | ~9.5ms | ~9.6ms |
+| append 100 rows | ~170ms | ~170ms |
+
+Narrow and mid-width reads get ~1.35x for free; wide reads and writes are
+unchanged. Going below ~16k starts costing write time and hurting wide reads.
+
+**`fsync=False`** saves roughly 24ms per write but gives up the crash guarantee:
+after a power loss the manifest may be durable while its rows are not, which is
+the one state the write ordering exists to prevent. Reasonable if the cache is
+genuinely disposable; not otherwise.
+
+Writes are dominated by rewriting the key's whole parquet file (~50ms per 2M
+rows, before compression choice). If that hurts, the answer is more keys — see
+below.
 
 ## Known limitations
 

@@ -30,7 +30,18 @@ class MemoryBackend:
         frame = self._frames.get(key.digest)
         return None if frame is None else frame.lazy()
 
-    def write(self, key: CacheKey, frame: pl.DataFrame, manifest: Manifest) -> None:
+    def write(
+        self,
+        key: CacheKey,
+        frame: pl.DataFrame,
+        manifest: Manifest,
+        *,
+        manifest_first: bool = False,
+    ) -> None:
+        # `manifest_first` is accepted for protocol conformance and ignored:
+        # there is no interruptible middle state to order when both updates are
+        # in-process dict assignments.
+        #
         # `clone` so a caller mutating the frame it handed us cannot reach into
         # the cache afterwards.
         if frame.width:

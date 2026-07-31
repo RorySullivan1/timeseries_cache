@@ -76,6 +76,31 @@ class TestRoundTrip:
         assert result.frame.empty
         assert isinstance(result.frame.index, pd.DatetimeIndex)
 
+    def test_empty_and_non_empty_reads_share_an_index_dtype(
+        self, pcache: PandasTimeseriesCache
+    ):
+        """Otherwise the two won't line up on concat or comparison — an
+        undated empty DatetimeIndex defaults to second resolution."""
+        empty = pcache.read(start=ts(1), end=ts(2), **SERIES).frame
+        pcache.write(pframe([1]), **SERIES)
+        filled = pcache.read(**SERIES).frame
+        assert empty.index.dtype == filled.index.dtype
+        assert pd.concat([empty, filled]).index.dtype == filled.index.dtype
+
+    def test_timestamps_with_no_data_columns_are_not_mistaken_for_emptiness(
+        self, pcache: PandasTimeseriesCache
+    ):
+        """`DataFrame.empty` is True for any frame with no *columns*, even one
+        carrying a full index. Treating that as "upstream had nothing" would
+        drop every timestamp while still claiming the window as covered."""
+        bare = pd.DataFrame(index=pd.DatetimeIndex([ts(1), ts(2)], tz="UTC", name="ts"))
+        assert bare.empty  # the trap
+        pcache.write(bare, start=ts(1), end=ts(2), **SERIES)
+
+        result = pcache.read(start=ts(1), end=ts(2), **SERIES)
+        assert result.frame.index.tolist() == [ts(1), ts(2)]
+        assert result.is_complete
+
 
 class TestBoundaryRejections:
     def test_rejects_a_naive_index(self, pcache: PandasTimeseriesCache):
@@ -208,6 +233,28 @@ class TestNoPolarsLeak:
 
         with pytest.raises(TimeseriesCacheError) as caught:
             pcache.write(pd.DataFrame({"price": [1.0]}), **SERIES)
+        assert "polars" not in type(caught.value).__module__
+
+    def test_duplicate_column_names_raise_a_package_error(
+        self, pcache: PandasTimeseriesCache
+    ):
+        """`pl.from_pandas` raises a bare polars ValueError on these."""
+        from timeseries_cache.errors import TimeseriesCacheError
+
+        dupes = pframe([1, 2])
+        dupes.insert(1, "price", [1.0, 2.0], allow_duplicates=True)
+        with pytest.raises(TimeseriesCacheError) as caught:
+            pcache.write(dupes, **SERIES)
+        assert "polars" not in type(caught.value).__module__
+
+    def test_unknown_column_on_read_raises_a_package_error(
+        self, pcache: PandasTimeseriesCache
+    ):
+        from timeseries_cache.errors import TimeseriesCacheError
+
+        pcache.write(pframe([1]), **SERIES)
+        with pytest.raises(TimeseriesCacheError) as caught:
+            pcache.read(columns=["nope"], **SERIES)
         assert "polars" not in type(caught.value).__module__
 
     def test_facade_owns_no_coverage_logic(self):

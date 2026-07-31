@@ -60,6 +60,11 @@ domain-specific kwarg name.** Flexibility here is a hard requirement, so:
 
 - Normalize before hashing: sort keys, canonicalize scalar values, reject unhashable
   or non-deterministic ones (dicts, sets, objects without a stable repr).
+- **Canonicalize to a structure, then JSON — never string concatenation.** Joining
+  `name=value` pairs with separators is forgeable: a string value containing the
+  separators impersonates extra kwargs, produces an identical canonical string, and
+  so slips past the manifest's collision check too. Values carry a type tag (`1` and
+  `"1"` must not collide) and JSON escaping keeps each one inside its own slot.
 - The same kwargs must produce the same key across processes and machines — no
   `hash()`, no insertion-order dependence, no locale-dependent formatting.
 - Kwargs are stored verbatim in the manifest alongside the hash, so a cache directory
@@ -98,10 +103,18 @@ this note exists to prevent.
 
 ### 5. A write either lands completely or not at all
 
-Data files are written to a temporary path and atomically renamed; the manifest is
-updated **last**. An interrupted write may leave an orphaned temp file (harmless,
-garbage-collectable) but must never leave the manifest claiming coverage whose rows
-aren't on disk. Prefer over-fetching after a crash to serving a silent hole.
+Files are written to a temporary path and atomically renamed. The rule is that the
+**interruptible middle state must under-claim**, which means the order depends on
+direction:
+
+- **Growing** (new rows, wider coverage) — data first, manifest last. A crash leaves
+  rows nothing claims: harmless, costs a refetch.
+- **Shrinking** (`delete`, which removes rows *and* their coverage) — manifest first,
+  data last. Data-first here would leave the manifest claiming a range whose rows are
+  gone, and a read would answer "covered, and genuinely empty" — the silent hole this
+  invariant exists to forbid. `StorageBackend.write` takes `manifest_first` for this.
+
+Prefer over-fetching after a crash to serving a silent hole, always.
 
 ## Frame layer: polars core, pandas facade
 
@@ -112,7 +125,12 @@ most consumers here are pandas.
   read followed by a filter. A cache whose entire read API is `[start, end]` gets its
   biggest win from only touching row groups that overlap the range. A change that
   collapses the lazy scan into an eager read is a performance regression, not a
-  refactor — treat it as one.
+  refactor — treat it as one. `DEFAULT_ROW_GROUP_SIZE` is the other half of that win:
+  row groups are the skip unit, so it is deliberately finer than polars' default.
+- **Benchmark before "optimizing" the merge path.** `merge_sorted` looks obviously
+  right there (both sides are sorted) and measures *slower* than concat-then-sort on
+  polars 1.43 — its sort has a fast path for nearly-ordered input. The write path is
+  dominated by rewriting the key's parquet file, not by the merge.
 - **Two typed facades over one core.** `TimeseriesCache` takes and returns
   `pl.DataFrame`; `PandasTimeseriesCache` takes and returns `pd.DataFrame` with a
   `DatetimeIndex`. Same methods, same semantics, static return types. Don't add a
