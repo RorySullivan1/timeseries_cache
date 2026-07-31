@@ -133,6 +133,12 @@ direction:
   gone, and a read would answer "covered, and genuinely empty" — the silent hole this
   invariant exists to forbid. `StorageBackend.write` takes `manifest_first` for this.
 
+The atomic step is always a **same-volume rename**. A rename cannot cross volumes —
+`os.replace` raises `EXDEV` — so when a file is built elsewhere (`staging_dir`, for a
+network root) it is copied to a temp beside the target first and renamed from there.
+Never publish by copying straight onto the target: that is the one shape where a
+reader can observe a half-written file.
+
 Prefer over-fetching after a crash to serving a silent hole, always.
 
 ## Frame layer: polars core, pandas facade
@@ -191,9 +197,11 @@ Documented in `python/README.md` and deliberate — don't "fix" them without ask
   writers to the same key can lose an update. On a shared network drive that stops
   being hypothetical — say so rather than assuming a caller has read this far.
 - **Network/DFS shares are second-class.** The atomic rename needs the target to be
-  unheld and deletable, and a share gives you neither reliably. `replace_attempts`
-  rides out transient holders (DFS Replication, indexers, antivirus); nothing
-  rescues a share ACL'd without delete rights, since a rename *is* a delete.
+  unheld and deletable, and a share gives you neither reliably. `staging_dir` moves
+  the build and the fsync onto local disk; `replace_attempts` rides out transient
+  holders (DFS Replication, indexers, antivirus); nothing rescues a share ACL'd
+  without delete rights, since a rename *is* a delete. Reads are unimproved by any
+  of it — a local `root` is still the better answer where it's an option.
 - **Whole-key rewrite on write.** Reads scale (pushdown); writes scale with key size,
   not change size. The answer is more keys, not a rewrite of the storage model.
 - **Schema is fixed per key.** Adding or retyping a column is refused, not migrated.

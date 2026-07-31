@@ -10,6 +10,7 @@ build one enormous directory::
 from __future__ import annotations
 
 import contextlib
+import errno
 import os
 import shutil
 import tempfile
@@ -79,6 +80,17 @@ class ParquetBackend:
             ``replace_backoff``. Set to 1 to fail immediately.
         replace_backoff: Seconds before the second attempt, doubling thereafter.
             The default gives up after roughly 1.5s of trying.
+        staging_dir: Where to build a file before publishing it. ``None`` (the
+            default) builds it beside the target, which is right for a local
+            cache: the rename is then a same-volume metadata operation with
+            nothing to copy.
+
+            Point it at local disk when ``root`` is a network or DFS share.
+            Parquet encoding and the fsync then happen on local storage, and
+            only the finished bytes cross the wire — as one streamed copy rather
+            than the many small writes encoding would otherwise push over SMB.
+            Publishing still lands a temp file beside the target and renames it
+            there, because a rename cannot cross volumes; see :meth:`_publish`.
     """
 
     def __init__(
@@ -90,6 +102,7 @@ class ParquetBackend:
         fsync: bool = True,
         replace_attempts: int = DEFAULT_REPLACE_ATTEMPTS,
         replace_backoff: float = DEFAULT_REPLACE_BACKOFF,
+        staging_dir: str | os.PathLike[str] | None = None,
     ) -> None:
         if replace_attempts < 1:
             raise ValueError("replace_attempts must be at least 1")
@@ -99,6 +112,7 @@ class ParquetBackend:
         self.fsync = fsync
         self.replace_attempts = replace_attempts
         self.replace_backoff = replace_backoff
+        self.staging_dir = Path(staging_dir) if staging_dir is not None else None
 
     def _dir(self, key: CacheKey) -> Path:
         return self.root / key.shard / key.digest
@@ -144,6 +158,7 @@ class ParquetBackend:
                     fsync=self.fsync,
                     attempts=self.replace_attempts,
                     backoff=self.replace_backoff,
+                    staging_dir=self.staging_dir,
                 )
             else:
                 # A schema-less empty write: there is no frame to store, only a
@@ -158,6 +173,7 @@ class ParquetBackend:
                 fsync=self.fsync,
                 attempts=self.replace_attempts,
                 backoff=self.replace_backoff,
+                staging_dir=self.staging_dir,
             )
 
         # Order matters, and which order is safe depends on direction — see the
@@ -171,6 +187,21 @@ class ParquetBackend:
             put_manifest()
 
     @staticmethod
+    def _flush(path: Path) -> None:
+        """Force a file's contents to storage.
+
+        Opened ``"r+b"``, not ``"rb"``: the descriptor handed to fsync must be
+        *writable*. POSIX permits fsync on a read-only descriptor, but on Windows
+        ``os.fsync`` is ``_commit()``, which rejects a read-only CRT handle with
+        EBADF — "Bad file descriptor" — so a read-only open works everywhere
+        except the platform most likely to be running it. ``r+b`` also avoids
+        truncating what ``produce`` just wrote.
+        """
+        with open(path, "r+b") as written:
+            written.flush()
+            os.fsync(written.fileno())
+
+    @staticmethod
     def _atomic_write(
         target: Path,
         produce: Callable[[Path], None],
@@ -178,34 +209,33 @@ class ParquetBackend:
         fsync: bool = True,
         attempts: int = DEFAULT_REPLACE_ATTEMPTS,
         backoff: float = DEFAULT_REPLACE_BACKOFF,
+        staging_dir: Path | None = None,
     ) -> None:
-        """Write via a sibling temp file, fsync, then rename over the target.
+        """Build a file, then put it in place without ever exposing a partial one.
 
         The rename is the atomic step: a reader sees either the whole old file
         or the whole new one, never a half-written parquet. The directory fsync
         afterwards is what makes the rename itself survive a power loss —
-        without it the ordering guarantee above holds only against a process
-        crash, not against the machine going down.
+        without it the ordering guarantee holds only against a process crash,
+        not against the machine going down.
+
+        With ``staging_dir`` set the file is *built* there — encoded and flushed
+        on local disk — and only the finished bytes cross to ``target``. See
+        :meth:`_publish` for why that still cannot be a single rename.
         """
+        build_dir = staging_dir if staging_dir is not None else target.parent
+        build_dir.mkdir(parents=True, exist_ok=True)
         descriptor, name = tempfile.mkstemp(
-            dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
+            dir=build_dir, prefix=f".{target.name}.", suffix=".tmp"
         )
         os.close(descriptor)
         tmp_path = Path(name)
         try:
             produce(tmp_path)
             if fsync:
-                # "r+b", not "rb": the descriptor handed to fsync must be
-                # *writable*. POSIX permits fsync on a read-only descriptor, but
-                # on Windows os.fsync is _commit(), which rejects a read-only
-                # CRT handle with EBADF — "Bad file descriptor" — so a read-only
-                # open here works everywhere except the platform most likely to
-                # be running it. r+b also avoids truncating what produce wrote.
-                with open(tmp_path, "r+b") as written:
-                    written.flush()
-                    os.fsync(written.fileno())
-            ParquetBackend._replace(
-                tmp_path, target, attempts=attempts, backoff=backoff
+                ParquetBackend._flush(tmp_path)
+            ParquetBackend._publish(
+                tmp_path, target, attempts=attempts, backoff=backoff, fsync=fsync
             )
             if fsync:
                 ParquetBackend._fsync_dir(target.parent)
@@ -218,6 +248,53 @@ class ParquetBackend:
             with contextlib.suppress(OSError):
                 tmp_path.unlink(missing_ok=True)
             raise
+
+    @staticmethod
+    def _publish(
+        built: Path,
+        target: Path,
+        *,
+        attempts: int = DEFAULT_REPLACE_ATTEMPTS,
+        backoff: float = DEFAULT_REPLACE_BACKOFF,
+        fsync: bool = True,
+    ) -> None:
+        """Move a finished file onto ``target``, atomically.
+
+        A rename is atomic but cannot cross volumes — ``os.replace`` raises
+        ``EXDEV`` rather than silently copying — so when the file was built on
+        local disk and the cache lives on a network share, publishing takes two
+        steps: stream it to a temp file *beside* the target, then rename within
+        that volume. Readers still only ever see the whole old file or the whole
+        new one; the copy lands under a name nothing looks for.
+
+        Same-volume builds skip the copy entirely and rename directly.
+        """
+        try:
+            ParquetBackend._replace(built, target, attempts=attempts, backoff=backoff)
+            return
+        except OSError as error:
+            if error.errno != errno.EXDEV:
+                raise
+
+        descriptor, name = tempfile.mkstemp(
+            dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
+        )
+        os.close(descriptor)
+        landed = Path(name)
+        try:
+            # One streamed copy of a finished file, rather than the many small
+            # writes parquet encoding would otherwise push across the wire.
+            shutil.copyfile(built, landed)
+            if fsync:
+                ParquetBackend._flush(landed)
+            ParquetBackend._replace(landed, target, attempts=attempts, backoff=backoff)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                landed.unlink(missing_ok=True)
+            raise
+        finally:
+            with contextlib.suppress(OSError):
+                built.unlink(missing_ok=True)
 
     @staticmethod
     def _replace(

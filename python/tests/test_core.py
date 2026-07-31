@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
@@ -857,6 +858,114 @@ class TestAtomicity:
 
         with pytest.raises(ValueError, match="at least 1"):
             ParquetBackend(tmp_path, replace_attempts=0)
+
+    def test_staging_builds_locally_and_publishes_across_volumes(
+        self, tmp_path, monkeypatch
+    ):
+        """The network-share shape: build on local disk, publish to the share.
+
+        A rename cannot cross volumes, so publishing streams the finished file
+        to a temp *beside* the target and renames it there. Simulated by making
+        any cross-directory replace raise EXDEV, which is what a real
+        local-disk-to-share rename does.
+        """
+        import errno
+        from pathlib import Path as P
+
+        from timeseries_cache.backends.parquet import ParquetBackend
+
+        real_replace = os.replace
+        copies: list[tuple[str, str]] = []
+
+        def cross_volume_replace(src, dst, *args, **kwargs):
+            if P(src).parent != P(dst).parent:
+                raise OSError(errno.EXDEV, "Invalid cross-device link")
+            return real_replace(src, dst, *args, **kwargs)
+
+        real_copyfile = shutil.copyfile
+
+        def recording_copyfile(src, dst, *args, **kwargs):
+            copies.append((str(src), str(dst)))
+            return real_copyfile(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(os, "replace", cross_volume_replace)
+        monkeypatch.setattr(shutil, "copyfile", recording_copyfile)
+
+        staging = tmp_path / "local_staging"
+        share = tmp_path / "share"
+        share.mkdir()
+        target = share / "data.parquet"
+
+        ParquetBackend._atomic_write(
+            target, lambda p: p.write_bytes(b"payload"), staging_dir=staging
+        )
+
+        assert target.read_bytes() == b"payload"
+        assert len(copies) == 1, "exactly one streamed copy should cross the volume"
+        assert P(copies[0][0]).parent == staging, "built in the staging directory"
+        assert P(copies[0][1]).parent == share, "landed beside the target"
+        assert list(share.iterdir()) == [target], "no temp left on the share"
+        assert not list(staging.iterdir()), "no temp left in staging"
+
+    def test_same_volume_staging_skips_the_copy(self, tmp_path, monkeypatch):
+        """Nothing should cross the wire when it doesn't have to."""
+        from timeseries_cache.backends.parquet import ParquetBackend
+
+        copies: list[str] = []
+        monkeypatch.setattr(
+            shutil, "copyfile", lambda *a, **k: copies.append(str(a[0]))
+        )
+
+        target = tmp_path / "data.parquet"
+        ParquetBackend._atomic_write(
+            target, lambda p: p.write_bytes(b"payload"), staging_dir=tmp_path
+        )
+
+        assert target.read_bytes() == b"payload"
+        assert not copies, "a same-volume publish is a rename, not a copy"
+
+    def test_staging_directory_is_created_if_missing(self, tmp_path):
+        from timeseries_cache.backends.parquet import ParquetBackend
+
+        staging = tmp_path / "does" / "not" / "exist"
+        target = tmp_path / "data.parquet"
+        ParquetBackend._atomic_write(
+            target, lambda p: p.write_bytes(b"x"), staging_dir=staging
+        )
+        assert staging.is_dir()
+        assert target.read_bytes() == b"x"
+
+    def test_a_failed_build_leaves_the_target_untouched(self, tmp_path):
+        """Staging must not weaken the guarantee: a failure mid-build cannot
+        disturb what is already published."""
+        from timeseries_cache.backends.parquet import ParquetBackend
+
+        staging = tmp_path / "staging"
+        target = tmp_path / "share" / "data.parquet"
+        target.parent.mkdir()
+        target.write_bytes(b"original")
+
+        def explode(_path):
+            raise RuntimeError("encoding failed")
+
+        with pytest.raises(RuntimeError):
+            ParquetBackend._atomic_write(target, explode, staging_dir=staging)
+
+        assert target.read_bytes() == b"original"
+        assert not list(staging.iterdir()), "staging temp should be cleaned up"
+        assert list(target.parent.iterdir()) == [target]
+
+    def test_the_cache_round_trips_through_a_staging_directory(self, tmp_path):
+        from timeseries_cache.backends.parquet import ParquetBackend
+
+        staging = tmp_path / "staging"
+        cache = TimeseriesCache(ParquetBackend(tmp_path / "share", staging_dir=staging))
+        cache.write(frame([1, 2]), **SERIES)
+        cache.write(frame([3, 4]), **SERIES)  # exercises the merge path too
+        cache.delete(start=ts(1), end=ts(1), **SERIES)
+
+        assert days(cache.read(**SERIES)) == [ts(2), ts(3), ts(4)]
+        assert not list(staging.iterdir()), "staging should be left clean"
 
     def test_atomic_write_cleans_up_after_a_failure(self, tmp_path):
         from timeseries_cache.backends.parquet import ParquetBackend

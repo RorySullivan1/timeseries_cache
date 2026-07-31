@@ -180,13 +180,38 @@ below.
 
 ## Network and DFS shares
 
-The cache stores a key by writing a temp file and renaming it over the old one.
-That is what makes a write atomic — but on Windows a file cannot be replaced
-while *anything* holds it open, and on a network or DFS share plenty of things
-transiently do: DFS Replication, the file server's indexer, antivirus, another
-client that just read the same key.
+If `root` is a UNC path or a mapped network drive, **stage locally**:
 
-The rename retries with backoff to ride those out:
+```python
+cache = open_cache(
+    r"\\server\share\cache", staging_dir=r"C:\Users\me\AppData\Local\tscache"
+)
+```
+
+Parquet encoding and the fsync then happen on local disk, and only finished
+bytes cross the wire — as one streamed copy rather than the many small writes
+encoding otherwise pushes over SMB.
+
+Publishing still takes two steps, because **a rename cannot cross volumes**:
+`os.replace` raises `EXDEV` rather than silently copying. So the finished file is
+copied to a temp *beside* the target and renamed there. Readers still only ever
+see the whole old file or the whole new one — the copy lands under a name
+nothing looks for, and the rename within the share is atomic as always.
+
+```
+staging_dir/  build ──fsync──►  finished file
+                                     │  one streamed copy
+share/        .data.parquet.tmp ◄────┘
+                     │  atomic rename, same volume
+              data.parquet
+```
+
+### The rename can still be refused
+
+On Windows a file cannot be replaced while *anything* holds it open, and on a
+share plenty of things transiently do: DFS Replication, the file server's
+indexer, antivirus, another client that just read the same key. The rename
+retries with backoff to ride those out:
 
 ```python
 ParquetBackend(root, replace_attempts=5, replace_backoff=0.1)  # ~1.5s of trying
@@ -204,9 +229,11 @@ the usual causes are:
 - **Another writer.** See the single-writer limitation below. On a shared drive
   that stops being hypothetical.
 
-**Prefer a local cache.** Beyond the locking, the read path leans on the
-filesystem for row-group skipping, and network latency undoes most of that.
-Cache locally, publish results to the share.
+**Staging fixes the write path, not the read path.** Reads still go straight to
+the share, and the row-group skipping the cache is tuned around gives back much
+less over a network. If a shared cache is a convenience rather than a
+requirement, a local `root` is faster in both directions — cache locally,
+publish results to the share.
 
 ## Known limitations
 

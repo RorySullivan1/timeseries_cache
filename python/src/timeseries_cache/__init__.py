@@ -82,14 +82,19 @@ def open_cache(
     *,
     timestamp_column: str = DEFAULT_TIMESTAMP_COLUMN,
     identity_columns: Sequence[str] = (),
+    staging_dir: str | os.PathLike[str] | None = None,
 ) -> TimeseriesCache:
     """Open a parquet-backed cache rooted at ``root``.
+
+    Pass ``staging_dir`` pointing at local disk when ``root`` is a network or
+    DFS share — files are then built and flushed locally, and only finished
+    bytes cross the wire.
 
     The convenience wiring lives here rather than in ``core`` so the coverage
     logic never imports a concrete backend.
     """
     return TimeseriesCache(
-        ParquetBackend(root),
+        ParquetBackend(root, staging_dir=staging_dir),
         timestamp_column=timestamp_column,
         identity_columns=identity_columns,
     )
@@ -100,12 +105,16 @@ def open_pandas_cache(
     *,
     timestamp_column: str = DEFAULT_TIMESTAMP_COLUMN,
     identity_columns: Sequence[str] = (),
+    staging_dir: str | os.PathLike[str] | None = None,
 ) -> PandasTimeseriesCache:
-    """Open a parquet-backed cache with the pandas facade."""
+    """Open a parquet-backed cache with the pandas facade.
+
+    See :func:`open_cache` for ``staging_dir``.
+    """
     from .pandas import PandasTimeseriesCache
 
     return PandasTimeseriesCache(
-        ParquetBackend(root),
+        ParquetBackend(root, staging_dir=staging_dir),
         timestamp_column=timestamp_column,
         identity_columns=identity_columns,
     )
