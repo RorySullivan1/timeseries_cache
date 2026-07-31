@@ -1,0 +1,208 @@
+# 05 — Backends, testing, and tuning
+
+*For whoever is wiring the cache into a project.*
+
+---
+
+Everything above the `StorageBackend` protocol is coverage logic; everything
+below it is bytes. That seam is what makes the cache testable without a
+filesystem, portable to other storage, and tunable for your read pattern.
+
+## Testing: the memory backend needs no filesystem
+
+```python
+import tempfile
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import polars as pl
+
+from timeseries_cache import CacheKey, MemoryBackend, ParquetBackend, TimeseriesCache
+
+TS = pl.Datetime("us", "UTC")
+BASE = datetime(2024, 1, 1, tzinfo=UTC)
+root = Path(tempfile.mkdtemp())
+
+
+def bars(n: int, start: int = 0) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "ts": [BASE + timedelta(days=i) for i in range(start, start + n)],
+            "close": [100.0 + i for i in range(start, start + n)],
+        },
+        schema={"ts": TS, "close": pl.Float64},
+    )
+
+
+cache = TimeseriesCache(MemoryBackend())
+cache.write(bars(3), ticker="AAPL")
+assert cache.read(ticker="AAPL").frame.height == 3
+```
+
+Same class, same semantics, nothing on disk. Point your unit tests at this and
+your integration tests at `ParquetBackend`.
+
+This repo's own suite parametrizes every behavioral test over both, which is
+what proves the coverage logic doesn't depend on storage details:
+
+```py
+# tests/conftest.py
+@pytest.fixture(params=["memory", "parquet"])
+def backend(request, tmp_path):
+    if request.param == "memory":
+        return MemoryBackend()
+    return ParquetBackend(tmp_path / "cache")
+```
+
+## Kwargs are the flexibility axis
+
+Nothing in the cache knows what a ticker is.
+
+```python
+store = MemoryBackend()
+cache = TimeseriesCache(store)
+
+cache.write(bars(2), ticker="AAPL", field="close", adjusted=True)
+cache.write(bars(2), ticker="AAPL", field="close", adjusted=False)
+cache.write(bars(2), desk="rates", book="EUR", tenor=10)
+
+assert len(list(store.digests())) == 3
+```
+
+`adjusted=True` and `adjusted=False` are different series. So is a rates book
+with completely unrelated kwargs.
+
+Keys are deterministic and order-independent:
+
+```python
+a = CacheKey.build({"ticker": "AAPL", "field": "close", "adjusted": True})
+b = CacheKey.build({"adjusted": True, "field": "close", "ticker": "AAPL"})
+assert a.digest == b.digest
+
+# Values are type-tagged, so these never collide:
+assert CacheKey.build({"n": 1}).digest != CacheKey.build({"n": "1"}).digest
+assert CacheKey.build({"n": 1}).digest != CacheKey.build({"n": True}).digest
+```
+
+The canonical form is JSON, so no value can forge its way into another kwarg's
+slot no matter what characters it contains:
+
+```python
+forged = CacheKey.build({"a": 'x", "b": "y'})
+target = CacheKey.build({"a": "x", "b": "y"})
+assert forged.digest != target.digest
+```
+
+Supported value types: `str`, `int`, `float`, `bool`, `None`, `date`,
+`datetime`, `Decimal`, `Enum`, and lists/tuples of those. Sets and dicts are
+refused — they have no reliable ordering across runs. `start`, `end`, `mode`,
+`columns` and `frame` are reserved for control parameters.
+
+## Keys are self-describing on disk
+
+```python
+disk = TimeseriesCache(ParquetBackend(root / "cache"))
+disk.write(bars(3), ticker="AAPL", field="close")
+
+files = sorted(
+    p.relative_to(root / "cache").as_posix()
+    for p in (root / "cache").rglob("*")
+    if p.is_file()
+)
+assert [Path(f).name for f in files] == ["data.parquet", "manifest.json"]
+
+manifest = disk.manifest(ticker="AAPL", field="close")
+assert manifest is not None
+assert manifest.kwargs == {"ticker": "AAPL", "field": "close"}
+```
+
+Layout is `<root>/<shard>/<digest>/`, sharded by the digest's first byte so a
+cache with many keys doesn't build one enormous directory. The kwargs are stored
+verbatim next to the hash, so a digest collision surfaces as an error rather
+than one series quietly serving another's rows.
+
+## Tuning
+
+All three knobs are on the backend:
+
+```python
+tuned = TimeseriesCache(
+    ParquetBackend(
+        root / "tuned",
+        row_group_size=64_000,  # the unit the reader can skip
+        compression="zstd",  # or "lz4": ~30% faster writes, ~2.7x bigger
+        fsync=True,  # durability; see below
+    )
+)
+tuned.write(bars(1_000), ticker="AAPL")
+
+lo = BASE + timedelta(days=400)
+assert tuned.read(start=lo, end=lo + timedelta(days=5), ticker="AAPL").frame.height == 6
+```
+
+**`row_group_size` is the one that matters.** Every read here is a time range and
+row groups are what the parquet reader can skip, so finer groups mean less
+over-reading. Measured against a 2M-row key:
+
+| | polars default | 64k (this default) |
+|---|---|---|
+| read 1,000-row window | ~6.0ms | ~4.4ms |
+| read 50,000-row window | ~6.0ms | ~4.4ms |
+| read 500,000-row window | ~9.5ms | ~9.6ms |
+| append 100 rows | ~170ms | ~170ms |
+
+Narrow and mid-width reads get ~1.35x for free. Below ~16k, write time starts
+climbing and wide reads get worse.
+
+## Durability
+
+Data and manifest are written to temp files and atomically renamed, ordered so
+an interrupted write always **under-claims**:
+
+| direction | order | what a crash leaves |
+|---|---|---|
+| growing (new rows, wider coverage) | data first, manifest last | rows nothing claims — harmless, costs a refetch |
+| shrinking (`delete`) | manifest first, data last | coverage dropped early — the range is refetched |
+
+The reverse of that second case would leave the manifest claiming a range whose
+rows are gone, and a read would answer *"covered, and genuinely empty"* — a
+silent hole.
+
+`fsync=False` is faster but gives that up: after a power loss the manifest may
+be durable while its rows are not. Reasonable only if the cache is genuinely
+disposable.
+
+## Sizing, and the limits worth knowing
+
+Reads scale — the time predicate pushes down. **Writes scale with the size of
+the key**, not the size of the change, because a write rewrites the key's whole
+parquet file. If a key grows large enough for that to hurt, the answer is more
+keys: split by symbol, by month, by whatever your access pattern slices on.
+
+Two other accepted limitations:
+
+- **Single writer per key.** A write is read-modify-write with no lock, so two
+  writers to the same key can lose an update. Different keys are fine, and so
+  are concurrent readers.
+- **Schema and identity are fixed per key.** Adding or retyping a column is
+  refused rather than migrated; so is changing `identity_columns`.
+
+## Porting to other storage
+
+The `StorageBackend` protocol is the seam. Implement five methods —
+`read_manifest`, `scan`, `write`, `delete`, `digests` — and the coverage logic
+comes along unchanged. Two rules for an implementation:
+
+- `scan` must return a **lazy** handle, or you lose predicate pushdown.
+- `write` owns atomicity and honours `manifest_first`, per the table above.
+
+## Takeaways
+
+- Use `MemoryBackend` in unit tests; parametrize over both when the behavior
+  under test is about the cache itself.
+- Kwargs are open-ended and deterministic — organise keys around how you
+  actually query, since a key is the unit of rewrite.
+- `row_group_size` is the read-path lever; `fsync` is the durability one.
+
+**Back to** [01 — The fetch loop](01-the-fetch-loop.md) for the model everything
+rests on.

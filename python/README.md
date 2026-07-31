@@ -14,13 +14,13 @@ pip install -e ".[pandas]"    # with the pandas facade
 
 ## Tutorials
 
-Runnable walkthroughs live in [`tutorials/`](tutorials/) — the fetch loop,
-surgical overwrite, trade data with repeating timestamps, the two facades, and
-wiring the cache into a project. Start with:
+Five walkthroughs in [`tutorials/`](tutorials/) — the fetch loop, surgical
+overwrite, trade data with repeating timestamps, the two facades, and wiring the
+cache into a project. Start with
+[01 — The fetch loop](tutorials/01-the-fetch-loop.md).
 
-```bash
-uv run python tutorials/01_the_fetch_loop.py
-```
+Their code blocks are extracted and executed by the test suite, so the examples
+are guaranteed to run against the code in this repo.
 
 ## The idea
 
