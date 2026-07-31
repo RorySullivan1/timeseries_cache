@@ -678,6 +678,63 @@ class TestAtomicity:
         )
         assert target.read_bytes() == b"payload"
 
+    @pytest.mark.parametrize("failing", ["open", "fsync", "close"])
+    def test_directory_fsync_never_breaks_a_write(
+        self, tmp_path, monkeypatch, failing: str
+    ):
+        """The directory fsync is a durability refinement, not a requirement.
+
+        Platforms disagree at every step — Windows can't open a directory as a
+        file, macOS and some network filesystems refuse to fsync one, and either
+        can leave a descriptor whose close then fails. Any of those raising
+        would turn a harmless quirk into a failed write, so all three are
+        guarded and this pins that down.
+        """
+        import stat
+        from pathlib import Path
+
+        from timeseries_cache.backends.parquet import ParquetBackend
+
+        real_open, real_fsync, real_close = os.open, os.fsync, os.close
+        ebadf = OSError(9, "Bad file descriptor")
+
+        def is_directory_fd(fd: int) -> bool:
+            return stat.S_ISDIR(os.fstat(fd).st_mode)
+
+        if failing == "open":
+
+            def fake_open(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+                if Path(path).is_dir():
+                    raise ebadf
+                return real_open(path, *args, **kwargs)
+
+            monkeypatch.setattr(os, "open", fake_open)
+
+        elif failing == "fsync":
+
+            def fake_fsync(fd: int) -> None:
+                if is_directory_fd(fd):
+                    raise ebadf
+                real_fsync(fd)
+
+            monkeypatch.setattr(os, "fsync", fake_fsync)
+
+        else:
+
+            def fake_close(fd: int) -> None:
+                directory = is_directory_fd(fd)
+                real_close(fd)  # still release it, then report failure
+                if directory:
+                    raise ebadf
+
+            monkeypatch.setattr(os, "close", fake_close)
+
+        target = tmp_path / "data.parquet"
+        ParquetBackend._atomic_write(target, lambda p: p.write_bytes(b"payload"))
+
+        assert target.read_bytes() == b"payload"
+        assert list(tmp_path.iterdir()) == [target], "a temp file was left behind"
+
     def test_atomic_write_cleans_up_after_a_failure(self, tmp_path):
         from timeseries_cache.backends.parquet import ParquetBackend
 

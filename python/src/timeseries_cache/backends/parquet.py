@@ -9,6 +9,7 @@ build one enormous directory::
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import tempfile
@@ -166,17 +167,33 @@ class ParquetBackend:
 
     @staticmethod
     def _fsync_dir(directory: Path) -> None:
-        """Persist a directory entry (the rename), where the platform allows it."""
+        """Persist a directory entry (the rename), where the platform allows it.
+
+        Entirely best-effort, and every step is guarded because platforms
+        disagree at every step: Windows cannot open a directory as a file at
+        all, macOS and several network filesystems accept the descriptor but
+        refuse to fsync it, and a descriptor left in an odd state by either can
+        make even the close fail. None of that should break a write that
+        otherwise succeeded — the durability this buys is a refinement on top of
+        the atomic rename, not something the write's correctness rests on.
+
+        The file fsync in ``_atomic_write`` is deliberately *not* guarded like
+        this. If that one fails, the data genuinely may not be on disk and the
+        caller needs to hear about it.
+        """
         try:
             descriptor = os.open(directory, os.O_RDONLY)
-        except OSError:  # pragma: no cover - Windows has no directory fd
-            return
+        except OSError:  # pragma: no cover - platform-dependent
+            return  # e.g. Windows, where a directory has no file descriptor
         try:
             os.fsync(descriptor)
-        except OSError:  # pragma: no cover - some filesystems refuse this
-            pass
+        except OSError:  # pragma: no cover - platform-dependent
+            pass  # e.g. macOS and some network filesystems
         finally:
-            os.close(descriptor)
+            # Guarded too: an unguarded close here turns a harmless
+            # platform quirk into a failed write.
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
 
     def delete(self, key: CacheKey) -> None:
         shutil.rmtree(self._dir(key), ignore_errors=True)
