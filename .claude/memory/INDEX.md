@@ -1,8 +1,9 @@
 # MEMORY INDEX  ·  keep ≤ ~80 lines
 
 ## State            (rewrite in place — current truth only, ≤ ~10 lines)
-- `python/` is complete: 251 tests green, ruff + `mypy --strict` clean, uv-managed. No other language port.
-- PR #1 squash-merged to main as `e7a4c91`. PR #2 open on `claude/ci-workflow` (GitHub Actions).
+- `python/` is complete: 314 tests green, ruff + `mypy --strict` clean on 3.11/3.12/3.13. No other language port.
+- PR #1 squash-merged to main as `e7a4c91`. PR #2 open on `claude/ci-workflow`: CI + composite row identity.
+- Row identity is `(timestamp, *identity_columns)`; default `()` = timestamp alone, unchanged behavior.
 - Remote branch deletion returns 403 from this environment's git proxy — must be done in the GitHub UI.
 - CLAUDE.md now describes shipped code, not a plan. All five invariants are implemented.
 - Frame layer: polars core + thin pandas facade. Consumers are mostly pandas.
@@ -27,16 +28,20 @@
 - [2026-07-31] Kept `concat + sort` over `merge_sorted` in `_merge`: measured faster in 5 of 6 shapes on polars 1.43 despite both inputs being sorted. Re-measure on a polars upgrade; don't swap on principle. — sessions/2026-07-31-2001-review-fixes.md
 - [2026-07-31] Mypy's `python_version` is deliberately unpinned: pinning it to the 3.11 floor makes 3.12/3.13 fail on numpy's own stubs. The 3.11 CI job guarantees the floor instead. Don't re-add the pin. — sessions/2026-07-31-2012-merge-and-ci.md
 - [2026-07-31] No `uv.lock` committed, so CI resolves fresh and an upstream release can turn it red with no local change. Intended for a template — early warning beats a lock that hides it. — sessions/2026-07-31-2012-merge-and-ci.md
+- [2026-07-31] Row identity is `(timestamp, *identity_columns)`, set per cache instance; the upsert anti-join, sorting, and duplicate detection all key on it. Driven by trade data, where correcting one print must not wipe the others at that instant. — sessions/2026-07-31-2021-composite-row-identity.md
+- [2026-07-31] Coverage stays purely time-based under composite identity: identity changes what a *row* is, never what a *range* means. `replace_window`/`delete`/gaps untouched. — sessions/2026-07-31-2021-composite-row-identity.md
+- [2026-07-31] The manifest records `identity_columns` and refuses a mismatch either way; missing field reads as timestamp-only, so no FORMAT_VERSION bump was needed. — sessions/2026-07-31-2021-composite-row-identity.md
 
 ## Threads          (open items; remove when closed)
 - Hooks invoke `python`, not `python3`; will silently no-op on a `python3`-only machine.
-- PR #2 (CI) not yet merged; drive it to green. Old branch `claude/timeseries-cache-template-pq0v1e` still needs deleting in the GitHub UI.
+- PR #2 (CI + row identity) not yet merged; drive it to green. Old branch `claude/timeseries-cache-template-pq0v1e` still needs deleting in the GitHub UI.
 - Interval algebra + cache semantics were fuzzed once by hand and came back clean; worth wiring in as property tests rather than a one-off.
 - No second language port; the backend protocol + manifest JSON are the intended seam.
-- Accepted (not bugs): single-writer per key, whole-key rewrite per write, schema fixed per key.
+- Accepted (not bugs): single-writer per key, whole-key rewrite per write, schema and identity fixed per key.
 
 ## Log              (append-only pointers)
 - 2026-07-31 1841 | bootstrap CLAUDE.md + claudeBrain asset port | sessions/2026-07-31-1841-bootstrap-claude-md.md
 - 2026-07-31 1908 | Python implementation: coverage manifest, write modes, both facades | sessions/2026-07-31-1908-python-implementation.md
 - 2026-07-31 2001 | review fixes: key forgery, delete ordering, row-group tuning | sessions/2026-07-31-2001-review-fixes.md
 - 2026-07-31 2012 | merge PR #1 to main; CI workflow on PR #2 | sessions/2026-07-31-2012-merge-and-ci.md
+- 2026-07-31 2021 | composite row identity for repeating timestamps | sessions/2026-07-31-2021-composite-row-identity.md
