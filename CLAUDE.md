@@ -20,6 +20,7 @@ self-contained implementation of the same contract, with its own build config.
 
 ```
 python/
+  tutorials/       # runnable, narrated examples; one per use case
   src/timeseries_cache/
     core.py        # TimeseriesCache: read / write / delete / coverage (polars in, polars out)
     pandas.py      # PandasTimeseriesCache: the same API, pandas in, pandas out
@@ -240,6 +241,13 @@ numpy-backed.
 The `backend` fixture in `tests/conftest.py` is parametrized over memory and parquet,
 so every behavioral test already runs twice; write tests against the fixture rather
 than constructing a backend directly, unless the test is *about* one backend.
+
+`tests/test_tutorials.py` executes every script in `tutorials/` and fails on a
+non-zero exit, so an API change that breaks an example breaks the build. Discovery is
+by glob — a new tutorial is covered automatically, but it must carry a module
+docstring and a row in `tutorials/README.md`, both of which are asserted. When you
+change public API, expect to update the tutorials alongside the tests; prose that
+still reads plausibly but no longer runs is worse than no example.
 
 ## Capabilities
 

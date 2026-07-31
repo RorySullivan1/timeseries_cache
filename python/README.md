@@ -12,6 +12,16 @@ uv sync --dev                 # development
 pip install -e ".[pandas]"    # with the pandas facade
 ```
 
+## Tutorials
+
+Runnable walkthroughs live in [`tutorials/`](tutorials/) — the fetch loop,
+surgical overwrite, trade data with repeating timestamps, the two facades, and
+wiring the cache into a project. Start with:
+
+```bash
+uv run python tutorials/01_the_fetch_loop.py
+```
+
 ## The idea
 
 Storing rows tells you what data exists. It cannot tell you whether a range with
