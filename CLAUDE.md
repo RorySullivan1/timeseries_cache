@@ -9,12 +9,11 @@ is a template, not a service: the deliverable is a small, dependency-light refer
 implementation that another project copies in and adapts. Correctness of the *coverage
 bookkeeping* is the product; the storage format is an implementation detail.
 
-**Status: greenfield.** Only this file, `README.md`, and `.claude/` exist. Everything
-below the "Intended layout" heading is the design to build toward, not code that exists
-yet. When you implement a piece, keep this file in sync — and when a section here
-conflicts with committed code, the code is wrong until someone says otherwise.
+**Status:** the Python implementation is complete and green (237 tests). No other
+language exists yet. The invariants below are implemented, not aspirational — when a
+section here conflicts with the code, that is a bug in one of them; say which.
 
-## Intended layout
+## Layout
 
 Language-partitioned at the top level, Python first. Each language directory is a
 self-contained implementation of the same contract, with its own build config.
@@ -29,10 +28,14 @@ python/
     intervals.py   # interval algebra: merge, subtract, gaps
     backends/      # StorageBackend protocol + parquet (default) + memory (tests)
     errors.py
-  tests/
+  tests/         # parametrized over both backends and both facades
   pyproject.toml
 <future-language>/ # same contract, same concepts, idiomatic to that language
 ```
+
+The convenience constructors (`open_cache`, `open_pandas_cache`) live in
+`__init__.py`, not `core.py` — that is what keeps `core` free of any concrete backend
+import while callers still get a one-liner.
 
 ## The invariants
 
@@ -137,12 +140,23 @@ most consumers here are pandas.
   not the coverage logic.
 - **The on-disk layout, manifest schema, and key-hashing scheme are a compatibility
   surface.** Changing any of them invalidates existing caches. Treat it as a caller
-  decision, not an implementation detail.
+  decision, not an implementation detail. `FORMAT_VERSION` in `index.py` exists for
+  exactly this; a manifest from the future is an error, not something to guess at.
+- **The manifest's schema strings are informational.** Schema checks compare the
+  *live* polars schema of the stored frame, so a polars release that changes a dtype's
+  `repr` doesn't invalidate every cache on disk. Don't reintroduce a string comparison.
 
-## Tooling (target)
+### Accepted limitations
 
-Not yet wired up. When creating `python/pyproject.toml`, use these so the commands
-below stay true:
+Documented in `python/README.md` and deliberate — don't "fix" them without asking:
+
+- **Single-writer per key.** Writes are read-modify-write with no lock. Concurrent
+  writers to the same key can lose an update.
+- **Whole-key rewrite on write.** Reads scale (pushdown); writes scale with key size,
+  not change size. The answer is more keys, not a rewrite of the storage model.
+- **Schema is fixed per key.** Adding or retyping a column is refused, not migrated.
+
+## Tooling
 
 | Task | Command (from `python/`) |
 |---|---|
@@ -150,7 +164,7 @@ below stay true:
 | Lint + format | `uv run ruff check . && uv run ruff format .` |
 | Type check | `uv run mypy src` |
 | Tests | `uv run pytest` |
-| A single test | `uv run pytest tests/test_core.py::test_replace_window_removes_stale_rows` |
+| A single test | `uv run pytest "tests/test_core.py::TestReplaceWindow::test_removes_stale_rows_the_new_data_no_longer_contains"` |
 
 Python 3.11+, ruff (88 cols), mypy on `src`, pytest. Runtime deps: `polars` in the
 core; `pandas` + `pyarrow` under a `[pandas]` extra. Install dev with the extra so the
@@ -170,6 +184,10 @@ rather than testing polars deeply and pandas shallowly. The pandas facade additi
 needs: index round-trip (a frame written and read back is `assert_frame_equal` to the
 original, index name, dtype, and tz included), and that column dtypes come back
 numpy-backed.
+
+The `backend` fixture in `tests/conftest.py` is parametrized over memory and parquet,
+so every behavioral test already runs twice; write tests against the fixture rather
+than constructing a backend directly, unless the test is *about* one backend.
 
 ## Capabilities
 

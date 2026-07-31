@@ -1,9 +1,9 @@
 # MEMORY INDEX  ·  keep ≤ ~80 lines
 
 ## State            (rewrite in place — current truth only, ≤ ~10 lines)
-- Greenfield. `CLAUDE.md` + `.claude/` exist; no source code, no `python/` dir, no toolchain.
-- CLAUDE.md is a design charter, not a description of code. Its five invariants are unbuilt.
-- Frame layer settled: polars core + thin pandas facade. Consumers are mostly pandas.
+- `python/` is complete: 237 tests green, ruff + `mypy --strict` clean, uv-managed. No other language port.
+- CLAUDE.md now describes shipped code, not a plan. All five invariants are implemented.
+- Frame layer: polars core + thin pandas facade. Consumers are mostly pandas.
 - Claude assets ported from `RorySullivan1/claudeBrain` (`example-project/.claude/` is the source to copy from).
 
 ## Decisions        (append-only; supersede, never delete)
@@ -15,11 +15,17 @@
 - [2026-07-31] Frame layer is **polars core + pandas facade**, not pandas. Decisive reason: `scan_parquet` + pushed-down time predicate on the read path, which is the whole game for a `[start, end]` API, plus no-index removes the write-mode bug class. Asymmetry sealed it — polars→pandas is one boundary call, pandas→polars later means retrofitting the read path. — sessions/2026-07-31-1841-bootstrap-claude-md.md
 - [2026-07-31] Two typed facades (`TimeseriesCache` polars / `PandasTimeseriesCache` pandas) rather than a `frame=` param, so return types stay static for the type checker. Consumers are mostly pandas, so the facade is first-class, not an afterthought. — sessions/2026-07-31-1841-bootstrap-claude-md.md
 - [2026-07-31] pandas conversion is numpy-backed by default (no `use_pyarrow_extension_array`): arrow-backed nulls differ from `np.nan` and would silently change downstream `pct_change`/`rolling`/`dropna`. — sessions/2026-07-31-1841-bootstrap-claude-md.md
+- [2026-07-31] Time domain is discrete at 1 microsecond; storage dtype is `Datetime("us","UTC")`. This is what makes closed-interval subtraction closable and "touching" well-defined. Sub-microsecond input is rejected, not truncated. — sessions/2026-07-31-1908-python-implementation.md
+- [2026-07-31] Kwarg canonicalization is type-tagged (`i:1` vs `s:1`), bool checked before int, sets/dicts rejected. Untagged, `1` and `"1"` would silently share a cache entry. — sessions/2026-07-31-1908-python-implementation.md
+- [2026-07-31] Schema checks compare the *live* polars schema of the stored frame; the manifest's schema strings are informational only. A string comparison would make a polars `repr` change invalidate every cache on disk. — sessions/2026-07-31-1908-python-implementation.md
+- [2026-07-31] `open_cache`/`open_pandas_cache` live in `__init__.py`, not `core.py`, so `core` never imports a concrete backend while callers still get a one-liner. — sessions/2026-07-31-1908-python-implementation.md
 
 ## Threads          (open items; remove when closed)
-- `python/` is empty — layout, module split, and all five invariants are unimplemented.
-- Manifest schema (serialization of covered intervals) specified in prose only; pin it in the first implementation session.
 - Hooks invoke `python`, not `python3`; will silently no-op on a `python3`-only machine.
+- No CI workflow — the toolchain commands are documented but nothing runs them on push.
+- No second language port; the backend protocol + manifest JSON are the intended seam.
+- Accepted (not bugs): single-writer per key, whole-key rewrite per write, schema fixed per key.
 
 ## Log              (append-only pointers)
 - 2026-07-31 1841 | bootstrap CLAUDE.md + claudeBrain asset port | sessions/2026-07-31-1841-bootstrap-claude-md.md
+- 2026-07-31 1908 | Python implementation: coverage manifest, write modes, both facades | sessions/2026-07-31-1908-python-implementation.md
