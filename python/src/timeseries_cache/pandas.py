@@ -53,11 +53,13 @@ class PandasTimeseriesCache:
         *,
         timestamp_column: str = DEFAULT_TIMESTAMP_COLUMN,
         identity_columns: Sequence[str] = (),
+        conform_schema: bool = True,
     ) -> None:
         self._cache = TimeseriesCache(
             backend,
             timestamp_column=timestamp_column,
             identity_columns=identity_columns,
+            conform_schema=conform_schema,
         )
 
     @property

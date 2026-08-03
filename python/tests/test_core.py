@@ -460,11 +460,26 @@ class TestReservedKwargs:
 
 
 class TestSchema:
-    def test_rejects_a_changed_dtype(self, cache: TimeseriesCache):
+    def test_rejects_a_changed_dtype_when_not_conforming(self, backend):
+        """With ``conform_schema=False`` the stored dtype must be matched exactly.
+
+        The default conforms instead — see ``tests/test_schema_conform.py``.
+        """
+        cache = TimeseriesCache(backend, conform_schema=False)
         cache.write(frame([1]), **SERIES)
         changed = frame([2]).with_columns(pl.col("price").cast(pl.Int64))
         with pytest.raises(SchemaMismatchError, match="stored as"):
             cache.write(changed, **SERIES)
+
+    def test_a_lossless_dtype_difference_conforms_by_default(
+        self, cache: TimeseriesCache
+    ):
+        cache.write(frame([1]), **SERIES)
+        cache.write(frame([2]).with_columns(pl.col("price").cast(pl.Int64)), **SERIES)
+
+        result = cache.read(**SERIES)
+        assert result.frame.schema["price"] == pl.Float64
+        assert result.frame.height == 2
 
     def test_rejects_an_added_column(self, cache: TimeseriesCache):
         cache.write(frame([1]), **SERIES)

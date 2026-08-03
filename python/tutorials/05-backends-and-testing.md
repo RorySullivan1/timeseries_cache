@@ -183,48 +183,66 @@ Two things staging does *not* fix: reads still go to the share, and on Windows
 the final rename can be refused while anything holds the target open — DFS
 Replication, an indexer, antivirus. `replace_attempts` retries through that.
 
-## When a column comes back empty
+## The stored schema wins
 
-A batch where a column was entirely null says nothing about that column's type,
-but something still has to name a dtype — and what gets named is an accident of
-the boundary. So an all-null column takes whatever type is already stored:
+Whatever produced a batch inferred its dtypes from that batch alone. A window
+whose values are all whole numbers arrives as `Int64`; one that came back
+entirely null arrives as `String`, because that is what pandas' `object`
+becomes. Neither is a schema change, so the stored dtype wins and the batch
+conforms to it:
 
 ```python
-nulls = TimeseriesCache(MemoryBackend())
-nulls.write(bars(2), ticker="AAPL")  # close: Float64
+typed = TimeseriesCache(MemoryBackend())
+typed.write(bars(2), ticker="AAPL")  # close: Float64
 
-blank = pl.DataFrame(
-    {"ts": [BASE + timedelta(days=5)], "close": [None]},
-    schema={"ts": TS, "close": pl.String},  # what pandas' object dtype arrives as
-)
-nulls.write(
-    blank, start=BASE + timedelta(days=5), end=BASE + timedelta(days=5), ticker="AAPL"
-)
 
-out = nulls.read(ticker="AAPL").frame
+def one(day: int, value: object, dtype: pl.DataType) -> pl.DataFrame:
+    return pl.DataFrame(
+        {"ts": [BASE + timedelta(days=day)], "close": [value]},
+        schema={"ts": TS, "close": dtype},
+    )
+
+
+typed.write(one(2, 102, pl.Int64), ticker="AAPL")  # Int64  -> Float64
+typed.write(one(3, "103.50", pl.String), ticker="AAPL")  # text   -> 103.5
+typed.write(one(4, None, pl.String), ticker="AAPL")  # all-null nulls out
+
+out = typed.read(ticker="AAPL").frame
 assert out.schema["close"] == pl.Float64
-assert out["close"].to_list() == [100.0, 101.0, None]
+assert out["close"].to_list() == [100.0, 101.0, 102.0, 103.5, None]
 ```
 
-Where nothing is stored yet the column is kept as `Null` — honestly *not yet
-known* — and the first write carrying values settles it. Both directions are
-lossless: casting an all-null column invents nothing and destroys nothing.
+Where nothing is stored yet, an all-null column is kept as `Null` — honestly
+*not yet known* — and the first write carrying values settles it.
 
-That is also where it stops. **A column with values is never cast**, because a
-lenient cast would turn `"cheap"` into `null` without a word:
+### It is checked, not assumed
+
+Conforming would be dangerous as a plain cast, because polars performs plenty of
+lossy conversions **without raising**: `1.5` becomes `1`, `5` becomes `True`, a
+microsecond becomes a millisecond. So every conversion has to clear three gates
+— the strict cast succeeds, no new nulls appear, and between exact types the
+values round-trip:
 
 ```python
 import pytest
 
 from timeseries_cache import SchemaMismatchError
 
-real = pl.DataFrame(
-    {"ts": [BASE + timedelta(days=6)], "close": ["cheap"]},
-    schema={"ts": TS, "close": pl.String},
-)
-with pytest.raises(SchemaMismatchError):
-    nulls.write(real, ticker="AAPL")
+whole = TimeseriesCache(MemoryBackend())
+whole.write(one(1, 100, pl.Int64), ticker="AAPL")  # close: Int64
+
+with pytest.raises(SchemaMismatchError):  # 1.5 would truncate to 1
+    whole.write(one(2, 1.5, pl.Float64), ticker="AAPL")
+
+with pytest.raises(SchemaMismatchError):  # 'cheap' would become null
+    whole.write(one(3, "cheap", pl.String), ticker="AAPL")
 ```
+
+Text sits outside the round-trip rule on purpose: `"1.50"` parsed to `1.5` and
+printed back is `"1.5"`, a difference in spelling rather than in data. And
+conforming settles dtypes only — an added or dropped column is a migration, not
+an inference artifact, and is still refused. `conform_schema=False` turns the
+whole thing off and demands exact dtypes.
 
 ## Durability
 
