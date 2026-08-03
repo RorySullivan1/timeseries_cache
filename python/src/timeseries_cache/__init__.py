@@ -82,6 +82,7 @@ def open_cache(
     *,
     timestamp_column: str = DEFAULT_TIMESTAMP_COLUMN,
     identity_columns: Sequence[str] = (),
+    conform_schema: bool = True,
     staging_dir: str | os.PathLike[str] | None = None,
 ) -> TimeseriesCache:
     """Open a parquet-backed cache rooted at ``root``.
@@ -90,6 +91,10 @@ def open_cache(
     DFS share — files are then built and flushed locally, and only finished
     bytes cross the wire.
 
+    ``conform_schema`` (on by default) lets an incoming column defer to the
+    dtype already stored where the conversion loses nothing; see
+    :class:`~timeseries_cache.core.TimeseriesCache`.
+
     The convenience wiring lives here rather than in ``core`` so the coverage
     logic never imports a concrete backend.
     """
@@ -97,6 +102,7 @@ def open_cache(
         ParquetBackend(root, staging_dir=staging_dir),
         timestamp_column=timestamp_column,
         identity_columns=identity_columns,
+        conform_schema=conform_schema,
     )
 
 
@@ -105,11 +111,12 @@ def open_pandas_cache(
     *,
     timestamp_column: str = DEFAULT_TIMESTAMP_COLUMN,
     identity_columns: Sequence[str] = (),
+    conform_schema: bool = True,
     staging_dir: str | os.PathLike[str] | None = None,
 ) -> PandasTimeseriesCache:
     """Open a parquet-backed cache with the pandas facade.
 
-    See :func:`open_cache` for ``staging_dir``.
+    See :func:`open_cache` for ``staging_dir`` and ``conform_schema``.
     """
     from .pandas import PandasTimeseriesCache
 
@@ -117,6 +124,7 @@ def open_pandas_cache(
         ParquetBackend(root, staging_dir=staging_dir),
         timestamp_column=timestamp_column,
         identity_columns=identity_columns,
+        conform_schema=conform_schema,
     )
 
 

@@ -188,16 +188,28 @@ most consumers here are pandas.
 - **The manifest's schema strings are informational.** Schema checks compare the
   *live* polars schema of the stored frame, so a polars release that changes a dtype's
   `repr` doesn't invalidate every cache on disk. Don't reintroduce a string comparison.
-- **A column of nothing but nulls does not vote on the schema.** Its dtype is an
-  artifact of the boundary, not information — pandas types `[None, None]` as `object`,
-  which arrives as polars `String`. So an all-null column is cast to whatever is
-  already stored, and where nothing is stored yet it is kept as `Null`, meaning *not
-  yet known*, until a write carrying real values settles it. Casting an all-null
-  column is lossless in both directions, which is the entire safety argument — and
-  the reason it stops exactly there. **A column with one real value is never cast**:
-  a lenient cast of populated data turns `"cheap"` into `null` silently, so a genuine
-  disagreement still raises `SchemaMismatchError`. Don't generalize this into "new
-  writes conform to the stored schema".
+- **The stored dtypes are the key's schema; a batch's dtypes are a guess.** Two rules
+  implement that, in this order, and both live in `write()` before `_check_schema`:
+  1. **A column of nothing but nulls does not vote.** Its dtype is an artifact of the
+     boundary, not information — pandas types `[None, None]` as `object`, which
+     arrives as polars `String`. So it takes whatever is already stored, and where
+     nothing is stored yet it is kept as `Null`, meaning *not yet known*, until a
+     write carrying real values settles it. This one runs first because it is the
+     only rule that can settle a type nothing has established yet.
+  2. **Everything else conforms to the stored dtype where that is provably
+     lossless** (`conform_schema=True`, the default). An `Int64` batch lands in a
+     `Float64` key; `"102.50"` parses into it.
+- **"Provably lossless" is checked, never assumed** — this is the whole safety
+  argument, so don't weaken it into a plain cast. Three gates: the strict cast must
+  succeed (`"cheap"` → `Float64` raises rather than becoming null); the null count
+  must not rise; and between types with exact representations (numeric, temporal,
+  boolean) the values must **round-trip**. That last one is what catches the
+  conversions polars performs *silently* — `1.5` → `1`, `5` → `True`, microseconds →
+  milliseconds, integers past 2⁵³. Text is deliberately outside the round-trip
+  family: `"1.50"` → `1.5` → `"1.5"` differs in spelling, not in data. Anything that
+  fails a gate raises `SchemaMismatchError`.
+- **Conforming settles dtypes, never the set of columns.** An added or dropped column
+  is a migration, not an inference artifact, and is still refused.
 
 ### Accepted limitations
 
@@ -214,9 +226,11 @@ Documented in `python/README.md` and deliberate — don't "fix" them without ask
   of it — a local `root` is still the better answer where it's an option.
 - **Whole-key rewrite on write.** Reads scale (pushdown); writes scale with key size,
   not change size. The answer is more keys, not a rewrite of the storage model.
-- **Schema is fixed per key.** Adding or retyping a column is refused, not migrated.
-  The one exception is a type that was never established: a column stored as `Null`
-  is settled by the first write that carries values (see the null-typing rule above).
+- **The column set is fixed per key.** Adding or dropping one is refused, not
+  migrated. Dtypes are *not* fixed in the same way — an incoming column conforms to
+  the stored dtype where that is provably lossless, and a column stored as `Null` is
+  settled by the first write carrying values (see the schema rules above). What is
+  fixed is the *stored* type: conforming never retypes what is already on disk.
 
 ## Tooling
 
@@ -263,10 +277,13 @@ identity columns — since the default path and the composite path take differen
 branches in sorting, duplicate detection, and the upsert join. `tests/test_identity.py`
 holds the composite cases.
 
-Anything touching schema reconciliation needs the pair that defines the line:
-an all-null column settled against the stored type, and a *partially* null one still
-raising. `tests/test_null_typing.py` holds them; a change that makes the second case
-pass silently is data loss, not a relaxation.
+Anything touching schema reconciliation needs both halves. `tests/test_null_typing.py`
+covers the all-null rule — a null batch settled against the stored type, and a first
+all-null write left open as `Null`. `tests/test_schema_conform.py` covers conforming,
+and its second class is the important one: every conversion polars performs *silently*
+(`1.5` → `1`, `5` → `True`, µs → ms, integers past 2⁵³, `"cheap"` → null) has a test
+asserting the write is refused. A change that makes any of those pass is data loss,
+not a relaxation — they are the reason conforming can be a default at all.
 
 Both facades must be tested against the same behavioral cases — parametrize over them
 rather than testing polars deeply and pandas shallowly. The pandas facade additionally

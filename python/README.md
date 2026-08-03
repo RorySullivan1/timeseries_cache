@@ -125,41 +125,61 @@ cache.write(corrected, start=t0, end=t1, mode="replace_window", **series)
   the cost is a refetch — never coverage claiming rows that aren't there.
 - Cache kwargs canonicalize to JSON before hashing, so no value can forge its
   way into another kwarg's slot no matter what characters it contains.
-- **A column of nothing but nulls does not get a vote on the schema.** See below.
+- **The stored dtypes are the key's schema**, and an incoming column conforms to
+  them where that loses nothing. See below.
 
-## Columns that come back empty
+## The stored schema wins
 
-A batch where a column was entirely null says nothing about that column's type,
-but something still has to name a dtype — and what gets named is an accident of
-the boundary. pandas turns `[None, None]` into `object`, which becomes polars
-`String`.
+Whatever produced a batch inferred its dtypes from that batch alone. A window
+whose prices all happen to be whole numbers arrives as `Int64` against a key
+holding `Float64`; a column that came back entirely null arrives as `String`,
+because that is what pandas' `object` becomes. None of that is a schema change,
+and failing the write over it is the wrong answer.
 
-Left alone that breaks both ways: it fixes a key's schema as `String` on the
-first write and rejects every real write after it, or it arrives later and gets
-rejected as a schema change. Neither is a schema change.
-
-So an all-null column takes whatever type is already stored:
+So the key's stored dtype wins and the batch conforms to it:
 
 ```python
-cache.write(prices_with_values, **series)  # price: Float64
-cache.write(prices_all_null, **series)  # inferred String -> stored Float64
+cache.write(prices, **series)  # price: Float64
+cache.write(whole_numbers, **series)  # Int64    -> stored Float64
+cache.write(quoted_numbers, **series)  # "102.50" -> 102.5
+cache.write(all_null_batch, **series)  # String   -> stored Float64
 ```
 
-and where nothing is stored yet, it is kept as `Null` — honestly *not yet known*
-— so a later write carrying real values settles it:
+Where nothing is stored yet, an all-null column is kept as `Null` — honestly
+*not yet known* — so a later write carrying real values settles it:
 
 ```python
 cache.write(all_null_batch, **series)  # price: Null  ("unknown")
 cache.write(real_batch, **series)  # price: Float64, settled
 ```
 
-Both directions are lossless: casting an all-null column invents nothing and
-destroys nothing.
+### What it will not do
 
-**A column with values is never cast.** One real value is enough to make the
-column's type its own, and a genuine disagreement still raises
-`SchemaMismatchError`. That line is deliberate — coercing a populated column to
-the stored type is exactly how `"cheap"` silently becomes `null`.
+Conforming is safe only because "lossless" is **checked against the values
+actually present** rather than assumed. Three gates; failing any raises
+`SchemaMismatchError`:
+
+| gate | what it stops |
+|---|---|
+| the strict cast must succeed | `"cheap"` → `Float64` becoming `null` |
+| the null count must not rise | anything quietly dropping out |
+| exact types must round-trip | `1.5` → `1`, `5` → `True`, µs → ms, integers past 2⁵³ |
+
+The third gate is the one that earns its keep: polars performs every one of
+those conversions **without raising**, so a plain "cast everything to the stored
+type" would take them all silently.
+
+Text sits outside the round-trip rule deliberately — `"1.50"` parsed to `1.5`
+and printed back is `"1.5"`, a difference in spelling, not in data.
+
+Conforming settles dtypes and nothing else. An added or dropped column is a
+migration, not an inference artifact, and is still refused.
+
+To demand exact dtypes on every write instead:
+
+```python
+cache = open_cache(root, conform_schema=False)
+```
 
 ## Layout
 
@@ -280,9 +300,11 @@ publish results to the share.
   well (the time predicate pushes down); writes scale with the size of the key,
   not the size of the change. Partition into more keys, or across time, if a
   single key grows large enough for that to hurt.
-- **Schema is fixed per key.** Adding or retyping a column is refused rather than
-  migrated. Delete the key or migrate it deliberately. The same goes for
+- **The column set is fixed per key.** Adding or dropping one is refused rather
+  than migrated — delete the key or migrate it deliberately. The same goes for
   `identity_columns`: a key can't change its notion of row identity in place.
+  Dtypes are the exception: an incoming column conforms to the stored one where
+  that is lossless (above), but the *stored* type never changes.
 
 ## Development
 

@@ -10,8 +10,10 @@ Neither is a schema change. Both are inference artifacts, and the cache settles
 them against what it already knows rather than letting a null batch vote.
 
 The safety argument is that casting an all-null column is lossless in every
-direction, so nothing can be invented or destroyed. A column *with* values is
-never touched — that is the line between this and silently coercing data.
+direction, so nothing can be invented or destroyed. It runs first, before
+schema conforming (``tests/test_schema_conform.py``), because it is the only
+rule that can settle a type nothing has established yet — conforming needs a
+stored dtype to defer *to*.
 """
 
 from __future__ import annotations
@@ -116,14 +118,18 @@ class TestRealConflictsStillRaise:
 
     def test_a_genuine_type_change_is_refused(self, cache: TimeseriesCache):
         cache.write(typed([1, 2], [101.0, 102.0], pl.Float64), **SERIES)
-        with pytest.raises(SchemaMismatchError, match="stored as Float64"):
+        with pytest.raises(SchemaMismatchError, match="do not convert"):
             cache.write(typed([3, 4], ["cheap", "dear"], pl.String), **SERIES)
 
-    def test_a_partially_null_column_is_not_coerced(self, cache: TimeseriesCache):
-        """One real value is enough to make the column's type its own.
+    def test_a_partially_null_column_with_unconvertible_values_is_refused(
+        self, cache: TimeseriesCache
+    ):
+        """Nulls beside a real value do not license coercing that value.
 
-        This is the case that separates settling an unknown type from silently
-        casting data — a lenient cast here would turn 'cheap' into null.
+        The values, not the null count, decide: 'cheap' has no Float64 reading,
+        and a lenient cast would make it null. Conforming refuses instead. (A
+        partially-null column whose values *do* convert lands — that is
+        ``tests/test_schema_conform.py``.)
         """
         cache.write(typed([1, 2], [101.0, 102.0], pl.Float64), **SERIES)
         with pytest.raises(SchemaMismatchError):

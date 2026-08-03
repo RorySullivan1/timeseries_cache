@@ -108,6 +108,13 @@ class TimeseriesCache:
             ``(timestamp, *identity_columns)`` the unit of uniqueness *and* the
             unit an ``upsert`` overwrites. Coverage stays purely time-based
             either way; only row identity changes.
+        conform_schema: When true (the default), a column whose dtype differs
+            from the one already stored is cast to the stored dtype, provided
+            the cast is **provably lossless** for the values present. A batch
+            that infers ``Int64`` where the key holds ``Float64`` then lands
+            instead of raising. A cast that would lose anything still raises
+            :class:`~timeseries_cache.errors.SchemaMismatchError`. Set false to
+            require every write to arrive already matching the stored dtypes.
     """
 
     def __init__(
@@ -116,6 +123,7 @@ class TimeseriesCache:
         *,
         timestamp_column: str = DEFAULT_TIMESTAMP_COLUMN,
         identity_columns: Sequence[str] = (),
+        conform_schema: bool = True,
     ) -> None:
         if timestamp_column in identity_columns:
             raise InvalidIdentityError(
@@ -130,6 +138,7 @@ class TimeseriesCache:
         self.backend = backend
         self.timestamp_column = timestamp_column
         self.identity_columns = tuple(identity_columns)
+        self.conform_schema = conform_schema
 
     @property
     def row_key(self) -> tuple[str, ...]:
@@ -286,6 +295,106 @@ class TimeseriesCache:
                 known = stored[name]
             if known != dtype:
                 casts.append(pl.col(name).cast(known))
+        return frame.with_columns(casts) if casts else frame
+
+    @staticmethod
+    def _is_exact(dtype: pl.DataType) -> bool:
+        """Types whose values have exactly one representation.
+
+        Within this family, casting back is a fair test of losslessness. Text is
+        deliberately outside it: ``"1.50"`` parsed to ``1.5`` and formatted back
+        is ``"1.5"``, which is a difference in spelling, not in data.
+        """
+        return dtype.is_numeric() or dtype.is_temporal() or dtype == pl.Boolean
+
+    @staticmethod
+    def _round_trips(column: pl.Series, target: pl.DataType) -> bool:
+        """Does casting to ``target`` and back reproduce every value exactly?
+
+        The honest test of "lossless for the values present", and the reason
+        conforming can be a default. It catches everything a strict cast waves
+        through: polars truncates ``1.5`` to ``1`` for Float64 -> Int64, maps
+        ``5`` to ``True`` for Int64 -> Boolean, drops sub-millisecond precision
+        for Datetime("us") -> Datetime("ms"), and loses the low bits of an
+        integer past 2**53 through Float64. None of those raise; all of them
+        fail to round-trip, so all of them are refused.
+
+        A pair polars cannot cast *back* is unverifiable rather than proven
+        lossless, and this answers False for it — refusing is the conservative
+        direction, and the only one consistent with conforming being a default.
+        """
+        try:
+            returned = column.cast(target).cast(column.dtype)
+        except pl.exceptions.PolarsError:
+            return False
+        return bool(returned.eq_missing(column).all())
+
+    def _conform_to_stored(
+        self, frame: pl.DataFrame, stored: pl.Schema | None
+    ) -> pl.DataFrame:
+        """Cast columns to the dtypes already stored, where that loses nothing.
+
+        The stored schema is the key's schema; a batch's inferred dtypes are a
+        guess made by whatever produced the batch. A vendor window whose values
+        all happen to be whole numbers infers ``Int64`` against a key holding
+        ``Float64``, and a partially-null column can land on a different type
+        from one fetch to the next. None of that is a schema change, and having
+        it fail the write is the wrong answer.
+
+        So an incoming column defers to the stored dtype — but only when the
+        conversion is **provably lossless for the values actually present**:
+
+        - the strict cast must succeed, so ``"cheap"`` -> ``Float64`` still
+          raises rather than becoming null (the failure mode that makes a blunt
+          "just cast everything" dangerous);
+        - nothing may become null that was not null already;
+        - between types with exact representations it must also round-trip, so
+          ``1.5`` -> ``Int64`` is refused rather than silently truncated.
+
+        Anything that fails those tests is a genuine disagreement and raises.
+        """
+        if stored is None:
+            return frame
+        casts: list[pl.Expr] = []
+        for name, dtype in frame.schema.items():
+            if name not in stored:
+                continue
+            target = stored[name]
+            if target == dtype or target == pl.Null:
+                continue
+            column = frame.get_column(name)
+            if dtype == pl.Null:
+                # No values to lose; the all-null path already settled this.
+                casts.append(pl.col(name).cast(target))
+                continue
+            try:
+                converted = column.cast(target)
+            except pl.exceptions.PolarsError:
+                raise SchemaMismatchError(
+                    f"{name!r} arrived as {dtype} and the key stores {target}, "
+                    f"and the values do not convert. Fix the source's types, or "
+                    f"pass conform_schema=False to require an exact match."
+                ) from None
+            if converted.null_count() != column.null_count():
+                raise SchemaMismatchError(
+                    f"{name!r} arrived as {dtype} and the key stores {target}; "
+                    f"converting would turn "
+                    f"{converted.null_count() - column.null_count()} value(s) "
+                    f"into null. Refusing rather than losing them."
+                )
+            if (
+                self._is_exact(dtype)
+                and self._is_exact(target)
+                and not self._round_trips(column, target)
+            ):
+                raise SchemaMismatchError(
+                    f"{name!r} arrived as {dtype} and the key stores {target}, "
+                    f"but the values do not survive the conversion — it would "
+                    f"change them (truncating 1.5 to 1, 5 to True, or a "
+                    f"microsecond to a millisecond). Send the column as "
+                    f"{target}, or store it as {dtype} under a new key."
+                )
+            casts.append(pl.col(name).cast(target))
         return frame.with_columns(casts) if casts else frame
 
     def _check_schema(self, stored: dict[str, str] | None, frame: pl.DataFrame) -> None:
@@ -538,6 +647,10 @@ class TimeseriesCache:
             # Settle all-null columns against what is already known *before*
             # checking, so an inference artifact never reads as a schema change.
             incoming = self._reconcile_null_typing(incoming, live)
+            if self.conform_schema:
+                # The stored dtypes are the key's schema; a batch's inferred
+                # dtypes are a guess. Defer to the former where nothing is lost.
+                incoming = self._conform_to_stored(incoming, live)
             stored = (
                 {name: str(dtype) for name, dtype in live.items()}
                 if live is not None
