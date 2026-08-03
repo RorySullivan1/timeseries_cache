@@ -1,8 +1,8 @@
 # MEMORY INDEX  ·  keep ≤ ~80 lines
 
 ## State            (rewrite in place — current truth only, ≤ ~10 lines)
-- `python/` is complete: 379 tests green, ruff + `mypy --strict` clean on 3.11/3.12/3.13. No other language port.
-- PRs #1-#5 all merged; main = `0812fdc`, verified green after merge. No branch in flight.
+- `python/` is complete: 423 tests green, ruff + `mypy --strict` clean on 3.11/3.12/3.13. No other language port.
+- PRs #1-#5 merged; **PR #6 open** on `claude/conform-to-stored-schema` (incoming dtypes conform to stored).
 - CI matrix is 3.11/3.12/3.13 × ubuntu/windows. Tutorials are markdown under `python/tutorials/`.
 - Row identity is `(timestamp, *identity_columns)`; default `()` = timestamp alone, unchanged behavior.
 - Remote branch deletion returns 403 from this environment's git proxy — must be done in the GitHub UI.
@@ -39,7 +39,8 @@
 - [2026-07-31] `os.fsync` needs a *writable* descriptor (`r+b`): POSIX permits read-only, Windows `_commit()` rejects it with EBADF. The directory fsync is best-effort and guards all three of its syscalls, including the close. — sessions/2026-07-31-2123-windows-portability.md
 
 - [2026-08-03] A rename cannot cross volumes (`os.replace` → `EXDEV`), so `staging_dir` publishes in two steps: one streamed copy to a temp *beside* the target, then a same-volume rename. Copying straight onto the target is the one shape where a reader sees a half-written file — never do it. — sessions/2026-08-03-1550-network-staging-and-null-typing.md
-- [2026-08-03] An all-null column never votes on a key's schema: it takes the stored type, or stays `Null` ("not yet known") until a write with values settles it. Safe *because* casting an all-null column is lossless in every direction. **A column with values is never cast** — a partially-null one still raises. Don't generalize to "new writes conform to the stored schema"; that turns `'cheap'` into `null` silently. — sessions/2026-08-03-1550-network-staging-and-null-typing.md
+- [2026-08-03] An all-null column never votes on a key's schema: it takes the stored type, or stays `Null` ("not yet known") until a write with values settles it. Safe *because* casting an all-null column is lossless in every direction. Runs first, because it is the only rule that can settle a type nothing has established. — sessions/2026-08-03-1550-network-staging-and-null-typing.md
+- [2026-08-03] **Supersedes the "never generalize this" caveat above.** Incoming columns now conform to the stored dtype (`conform_schema=True`) where it is *provably lossless for the values present*: strict cast succeeds, null count doesn't rise, and between exact types (numeric ∪ temporal ∪ boolean) the values round-trip. The round-trip gate is what earns the default — polars does `1.5`→`1`, `5`→`True`, µs→ms and `2**53+1`→`2**53` **without raising**. Text is outside the gate on purpose (`"1.50"`→`1.5` is spelling). Never weaken this to a plain cast. — sessions/2026-08-03-1700-conform-to-stored-schema.md
 
 ## Threads          (open items; remove when closed)
 - Hooks invoke `python`, not `python3`; will silently no-op on a `python3`-only machine.
@@ -58,3 +59,4 @@
 - 2026-07-31 2037 | runnable tutorials, tested in CI | sessions/2026-07-31-2037-tutorials.md
 - 2026-07-31 2123 | Windows portability: open-file replace, masked errors, fsync descriptors | sessions/2026-07-31-2123-windows-portability.md
 - 2026-08-03 1550 | local staging + rename retry for DFS shares; all-null columns don't vote on the schema | sessions/2026-08-03-1550-network-staging-and-null-typing.md
+- 2026-08-03 1700 | incoming dtypes conform to the stored schema, gated on provable losslessness | sessions/2026-08-03-1700-conform-to-stored-schema.md
