@@ -250,6 +250,44 @@ class TimeseriesCache:
     def _schema_of(frame: pl.DataFrame) -> dict[str, str]:
         return {name: str(dtype) for name, dtype in frame.schema.items()}
 
+    @staticmethod
+    def _is_all_null(frame: pl.DataFrame, column: str) -> bool:
+        if frame.height == 0:
+            return True
+        return frame.get_column(column).null_count() == frame.height
+
+    def _reconcile_null_typing(
+        self, frame: pl.DataFrame, stored: pl.Schema | None
+    ) -> pl.DataFrame:
+        """Stop a column of nothing but nulls from voting on the schema.
+
+        A batch where a column came back entirely null carries no information
+        about that column's type, but something still has to name a dtype, and
+        what gets named is an accident of the boundary: pandas turns ``[None,
+        None]`` into ``object``, which becomes polars ``String``. Left alone
+        that either fixes a key's schema as ``String`` on the first write and
+        rejects every real write after it, or arrives later and gets rejected
+        as a schema change. Neither is a schema change — both are inference
+        artifacts.
+
+        So an all-null column never gets a vote. It takes the stored dtype where
+        one is known, and is stored as ``Null`` — honestly "not yet known" —
+        where one is not, so that a later write carrying real values can settle
+        it. Casting an all-null column is lossless in every direction, which is
+        what makes this safe; a column *with* values is never touched, so a
+        genuine disagreement still raises.
+        """
+        casts: list[pl.Expr] = []
+        for name, dtype in frame.schema.items():
+            if name in self.row_key or not self._is_all_null(frame, name):
+                continue
+            known: pl.DataType | type[pl.DataType] = pl.Null
+            if stored is not None and name in stored:
+                known = stored[name]
+            if known != dtype:
+                casts.append(pl.col(name).cast(known))
+        return frame.with_columns(casts) if casts else frame
+
     def _check_schema(self, stored: dict[str, str] | None, frame: pl.DataFrame) -> None:
         """Compare an incoming frame against the schema already on disk.
 
@@ -270,10 +308,17 @@ class TimeseriesCache:
         if added := sorted(new_cols - stored_cols):
             details.append(f"unexpected columns {added}")
         for name in sorted(stored_cols & new_cols):
+            # A stored `Null` column means every row written so far was null, so
+            # the type was never established. A write that finally carries values
+            # settles it rather than conflicting with it.
+            if stored[name] == str(pl.Null):
+                continue
             if stored[name] != incoming[name]:
                 details.append(
                     f"{name!r} is {incoming[name]}, stored as {stored[name]}"
                 )
+        if not details:
+            return
         raise SchemaMismatchError(
             "incoming frame does not match the stored schema: "
             + "; ".join(details)
@@ -488,10 +533,14 @@ class TimeseriesCache:
                 )
 
         existing = self.backend.scan(key) if manifest is not None else None
+        live = existing.collect_schema() if existing is not None else None
         if not schemaless_empty:
+            # Settle all-null columns against what is already known *before*
+            # checking, so an inference artifact never reads as a schema change.
+            incoming = self._reconcile_null_typing(incoming, live)
             stored = (
-                {name: str(dtype) for name, dtype in existing.collect_schema().items()}
-                if existing is not None
+                {name: str(dtype) for name, dtype in live.items()}
+                if live is not None
                 else (manifest.schema if manifest else None)
             )
             self._check_schema(stored, incoming)
@@ -545,9 +594,21 @@ class TimeseriesCache:
                 ).collect()
             return existing_lazy.collect()
 
+        # Promote any column the stored data left as `Null` — every row written
+        # so far was null, and this write finally names the type. The existing
+        # rows are all null in that column, so the cast invents nothing.
+        stored_schema = existing_lazy.collect_schema()
+        promotions = [
+            pl.col(name).cast(incoming.schema[name])
+            for name, dtype in stored_schema.items()
+            if dtype == pl.Null and incoming.schema.get(name, pl.Null) != pl.Null
+        ]
+        if promotions:
+            existing_lazy = existing_lazy.with_columns(promotions)
+
         # Align column order so the concat is unambiguous; schema equality was
         # already enforced above.
-        incoming = incoming.select(existing_lazy.collect_schema().names())
+        incoming = incoming.select(stored_schema.names())
 
         if mode is WriteMode.REPLACE_WINDOW:
             kept = existing_lazy.filter(

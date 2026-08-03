@@ -125,6 +125,41 @@ cache.write(corrected, start=t0, end=t1, mode="replace_window", **series)
   the cost is a refetch — never coverage claiming rows that aren't there.
 - Cache kwargs canonicalize to JSON before hashing, so no value can forge its
   way into another kwarg's slot no matter what characters it contains.
+- **A column of nothing but nulls does not get a vote on the schema.** See below.
+
+## Columns that come back empty
+
+A batch where a column was entirely null says nothing about that column's type,
+but something still has to name a dtype — and what gets named is an accident of
+the boundary. pandas turns `[None, None]` into `object`, which becomes polars
+`String`.
+
+Left alone that breaks both ways: it fixes a key's schema as `String` on the
+first write and rejects every real write after it, or it arrives later and gets
+rejected as a schema change. Neither is a schema change.
+
+So an all-null column takes whatever type is already stored:
+
+```python
+cache.write(prices_with_values, **series)  # price: Float64
+cache.write(prices_all_null, **series)  # inferred String -> stored Float64
+```
+
+and where nothing is stored yet, it is kept as `Null` — honestly *not yet known*
+— so a later write carrying real values settles it:
+
+```python
+cache.write(all_null_batch, **series)  # price: Null  ("unknown")
+cache.write(real_batch, **series)  # price: Float64, settled
+```
+
+Both directions are lossless: casting an all-null column invents nothing and
+destroys nothing.
+
+**A column with values is never cast.** One real value is enough to make the
+column's type its own, and a genuine disagreement still raises
+`SchemaMismatchError`. That line is deliberate — coercing a populated column to
+the stored type is exactly how `"cheap"` silently becomes `null`.
 
 ## Layout
 

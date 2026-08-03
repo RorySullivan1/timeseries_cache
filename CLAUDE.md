@@ -188,6 +188,16 @@ most consumers here are pandas.
 - **The manifest's schema strings are informational.** Schema checks compare the
   *live* polars schema of the stored frame, so a polars release that changes a dtype's
   `repr` doesn't invalidate every cache on disk. Don't reintroduce a string comparison.
+- **A column of nothing but nulls does not vote on the schema.** Its dtype is an
+  artifact of the boundary, not information — pandas types `[None, None]` as `object`,
+  which arrives as polars `String`. So an all-null column is cast to whatever is
+  already stored, and where nothing is stored yet it is kept as `Null`, meaning *not
+  yet known*, until a write carrying real values settles it. Casting an all-null
+  column is lossless in both directions, which is the entire safety argument — and
+  the reason it stops exactly there. **A column with one real value is never cast**:
+  a lenient cast of populated data turns `"cheap"` into `null` silently, so a genuine
+  disagreement still raises `SchemaMismatchError`. Don't generalize this into "new
+  writes conform to the stored schema".
 
 ### Accepted limitations
 
@@ -205,6 +215,8 @@ Documented in `python/README.md` and deliberate — don't "fix" them without ask
 - **Whole-key rewrite on write.** Reads scale (pushdown); writes scale with key size,
   not change size. The answer is more keys, not a rewrite of the storage model.
 - **Schema is fixed per key.** Adding or retyping a column is refused, not migrated.
+  The one exception is a type that was never established: a column stored as `Null`
+  is settled by the first write that carries values (see the null-typing rule above).
 
 ## Tooling
 
@@ -250,6 +262,11 @@ Anything touching row identity needs both configurations — timestamp-only *and
 identity columns — since the default path and the composite path take different
 branches in sorting, duplicate detection, and the upsert join. `tests/test_identity.py`
 holds the composite cases.
+
+Anything touching schema reconciliation needs the pair that defines the line:
+an all-null column settled against the stored type, and a *partially* null one still
+raising. `tests/test_null_typing.py` holds them; a change that makes the second case
+pass silently is data loss, not a relaxation.
 
 Both facades must be tested against the same behavioral cases — parametrize over them
 rather than testing polars deeply and pandas shallowly. The pandas facade additionally

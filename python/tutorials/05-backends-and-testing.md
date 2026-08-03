@@ -183,6 +183,49 @@ Two things staging does *not* fix: reads still go to the share, and on Windows
 the final rename can be refused while anything holds the target open — DFS
 Replication, an indexer, antivirus. `replace_attempts` retries through that.
 
+## When a column comes back empty
+
+A batch where a column was entirely null says nothing about that column's type,
+but something still has to name a dtype — and what gets named is an accident of
+the boundary. So an all-null column takes whatever type is already stored:
+
+```python
+nulls = TimeseriesCache(MemoryBackend())
+nulls.write(bars(2), ticker="AAPL")  # close: Float64
+
+blank = pl.DataFrame(
+    {"ts": [BASE + timedelta(days=5)], "close": [None]},
+    schema={"ts": TS, "close": pl.String},  # what pandas' object dtype arrives as
+)
+nulls.write(
+    blank, start=BASE + timedelta(days=5), end=BASE + timedelta(days=5), ticker="AAPL"
+)
+
+out = nulls.read(ticker="AAPL").frame
+assert out.schema["close"] == pl.Float64
+assert out["close"].to_list() == [100.0, 101.0, None]
+```
+
+Where nothing is stored yet the column is kept as `Null` — honestly *not yet
+known* — and the first write carrying values settles it. Both directions are
+lossless: casting an all-null column invents nothing and destroys nothing.
+
+That is also where it stops. **A column with values is never cast**, because a
+lenient cast would turn `"cheap"` into `null` without a word:
+
+```python
+import pytest
+
+from timeseries_cache import SchemaMismatchError
+
+real = pl.DataFrame(
+    {"ts": [BASE + timedelta(days=6)], "close": ["cheap"]},
+    schema={"ts": TS, "close": pl.String},
+)
+with pytest.raises(SchemaMismatchError):
+    nulls.write(real, ticker="AAPL")
+```
+
 ## Durability
 
 Data and manifest are written to temp files and atomically renamed, ordered so
