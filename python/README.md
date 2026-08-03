@@ -125,6 +125,41 @@ cache.write(corrected, start=t0, end=t1, mode="replace_window", **series)
   the cost is a refetch — never coverage claiming rows that aren't there.
 - Cache kwargs canonicalize to JSON before hashing, so no value can forge its
   way into another kwarg's slot no matter what characters it contains.
+- **A column of nothing but nulls does not get a vote on the schema.** See below.
+
+## Columns that come back empty
+
+A batch where a column was entirely null says nothing about that column's type,
+but something still has to name a dtype — and what gets named is an accident of
+the boundary. pandas turns `[None, None]` into `object`, which becomes polars
+`String`.
+
+Left alone that breaks both ways: it fixes a key's schema as `String` on the
+first write and rejects every real write after it, or it arrives later and gets
+rejected as a schema change. Neither is a schema change.
+
+So an all-null column takes whatever type is already stored:
+
+```python
+cache.write(prices_with_values, **series)  # price: Float64
+cache.write(prices_all_null, **series)  # inferred String -> stored Float64
+```
+
+and where nothing is stored yet, it is kept as `Null` — honestly *not yet known*
+— so a later write carrying real values settles it:
+
+```python
+cache.write(all_null_batch, **series)  # price: Null  ("unknown")
+cache.write(real_batch, **series)  # price: Float64, settled
+```
+
+Both directions are lossless: casting an all-null column invents nothing and
+destroys nothing.
+
+**A column with values is never cast.** One real value is enough to make the
+column's type its own, and a genuine disagreement still raises
+`SchemaMismatchError`. That line is deliberate — coercing a populated column to
+the stored type is exactly how `"cheap"` silently becomes `null`.
 
 ## Layout
 
@@ -177,6 +212,63 @@ genuinely disposable; not otherwise.
 Writes are dominated by rewriting the key's whole parquet file (~50ms per 2M
 rows, before compression choice). If that hurts, the answer is more keys — see
 below.
+
+## Network and DFS shares
+
+If `root` is a UNC path or a mapped network drive, **stage locally**:
+
+```python
+cache = open_cache(
+    r"\\server\share\cache", staging_dir=r"C:\Users\me\AppData\Local\tscache"
+)
+```
+
+Parquet encoding and the fsync then happen on local disk, and only finished
+bytes cross the wire — as one streamed copy rather than the many small writes
+encoding otherwise pushes over SMB.
+
+Publishing still takes two steps, because **a rename cannot cross volumes**:
+`os.replace` raises `EXDEV` rather than silently copying. So the finished file is
+copied to a temp *beside* the target and renamed there. Readers still only ever
+see the whole old file or the whole new one — the copy lands under a name
+nothing looks for, and the rename within the share is atomic as always.
+
+```
+staging_dir/  build ──fsync──►  finished file
+                                     │  one streamed copy
+share/        .data.parquet.tmp ◄────┘
+                     │  atomic rename, same volume
+              data.parquet
+```
+
+### The rename can still be refused
+
+On Windows a file cannot be replaced while *anything* holds it open, and on a
+share plenty of things transiently do: DFS Replication, the file server's
+indexer, antivirus, another client that just read the same key. The rename
+retries with backoff to ride those out:
+
+```python
+ParquetBackend(root, replace_attempts=5, replace_backoff=0.1)  # ~1.5s of trying
+```
+
+Raise `replace_attempts` if your share is slow to let go. If it fails on *every*
+attempt, the holder is permanent rather than transient — the error says so, and
+the usual causes are:
+
+- **No delete rights.** Replacing a file needs delete permission on it, or
+  delete-child on its directory. A share ACL'd "create and write, but not
+  delete" — a common corporate default — lets every step of a write succeed
+  except the rename, and blocks cleaning up the temp file too. No library
+  change can work around this; the directory needs Modify.
+- **Another writer.** See the single-writer limitation below. On a shared drive
+  that stops being hypothetical.
+
+**Staging fixes the write path, not the read path.** Reads still go straight to
+the share, and the row-group skipping the cache is tuned around gives back much
+less over a network. If a shared cache is a convenience rather than a
+requirement, a local `root` is faster in both directions — cache locally,
+publish results to the share.
 
 ## Known limitations
 

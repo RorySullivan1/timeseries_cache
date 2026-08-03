@@ -1,8 +1,9 @@
 # MEMORY INDEX  ·  keep ≤ ~80 lines
 
 ## State            (rewrite in place — current truth only, ≤ ~10 lines)
-- `python/` is complete: 340 tests green, ruff + `mypy --strict` clean on 3.11/3.12/3.13. No other language port.
-- PRs #1-#3 all merged; main = `4612191`. No branch in flight. Tutorials are markdown under `python/tutorials/`.
+- `python/` is complete: 379 tests green, ruff + `mypy --strict` clean on 3.11/3.12/3.13. No other language port.
+- PRs #1-#4 merged; **PR #5 open** on `claude/network-share-retry` (local staging + rename retry + null typing).
+- CI matrix is 3.11/3.12/3.13 × ubuntu/windows. Tutorials are markdown under `python/tutorials/`.
 - Row identity is `(timestamp, *identity_columns)`; default `()` = timestamp alone, unchanged behavior.
 - Remote branch deletion returns 403 from this environment's git proxy — must be done in the GitHub UI.
 - CLAUDE.md now describes shipped code, not a plan. All five invariants are implemented.
@@ -37,10 +38,13 @@
 - [2026-07-31] Cleanup in an `except` block must be `contextlib.suppress`ed: an exception raised there *replaces* the one being handled, so a failed unlink hid the real error and made the reported fault appear to move. — sessions/2026-07-31-2123-windows-portability.md
 - [2026-07-31] `os.fsync` needs a *writable* descriptor (`r+b`): POSIX permits read-only, Windows `_commit()` rejects it with EBADF. The directory fsync is best-effort and guards all three of its syscalls, including the close. — sessions/2026-07-31-2123-windows-portability.md
 
+- [2026-08-03] A rename cannot cross volumes (`os.replace` → `EXDEV`), so `staging_dir` publishes in two steps: one streamed copy to a temp *beside* the target, then a same-volume rename. Copying straight onto the target is the one shape where a reader sees a half-written file — never do it. — sessions/2026-08-03-1550-network-staging-and-null-typing.md
+- [2026-08-03] An all-null column never votes on a key's schema: it takes the stored type, or stays `Null` ("not yet known") until a write with values settles it. Safe *because* casting an all-null column is lossless in every direction. **A column with values is never cast** — a partially-null one still raises. Don't generalize to "new writes conform to the stored schema"; that turns `'cheap'` into `null` silently. — sessions/2026-08-03-1550-network-staging-and-null-typing.md
+
 ## Threads          (open items; remove when closed)
 - Hooks invoke `python`, not `python3`; will silently no-op on a `python3`-only machine.
-- **CI is ubuntu-only and has missed three Windows bugs.** Adding `windows-latest` is the open fix.
-- All three merged branches still on origin — deletion 403s from here, needs the GitHub UI.
+- **The user's DFS-share write failure is unconfirmed fixed** — they never ran `diagnose_windows.py`. Staging + retry target the most probable cause; that is inference, not a diagnosis.
+- All merged branches still on origin — deletion 403s from here, needs the GitHub UI.
 - Interval algebra + cache semantics were fuzzed once by hand and came back clean; worth wiring in as property tests rather than a one-off.
 - No second language port; the backend protocol + manifest JSON are the intended seam.
 - Accepted (not bugs): single-writer per key, whole-key rewrite per write, schema and identity fixed per key.
@@ -53,3 +57,4 @@
 - 2026-07-31 2021 | composite row identity for repeating timestamps | sessions/2026-07-31-2021-composite-row-identity.md
 - 2026-07-31 2037 | runnable tutorials, tested in CI | sessions/2026-07-31-2037-tutorials.md
 - 2026-07-31 2123 | Windows portability: open-file replace, masked errors, fsync descriptors | sessions/2026-07-31-2123-windows-portability.md
+- 2026-08-03 1550 | local staging + rename retry for DFS shares; all-null columns don't vote on the schema | sessions/2026-08-03-1550-network-staging-and-null-typing.md

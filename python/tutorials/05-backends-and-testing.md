@@ -154,6 +154,78 @@ over-reading. Measured against a 2M-row key:
 Narrow and mid-width reads get ~1.35x for free. Below ~16k, write time starts
 climbing and wide reads get worse.
 
+## Caching onto a network or DFS share
+
+If `root` is a UNC path or mapped drive, build files locally and let only
+finished bytes cross the wire:
+
+```python
+networked = TimeseriesCache(
+    ParquetBackend(
+        root / "pretend_share",
+        staging_dir=root / "local_staging",
+    )
+)
+networked.write(bars(50), ticker="AAPL")
+networked.write(bars(50, start=50), ticker="AAPL")
+
+assert networked.read(ticker="AAPL").frame.height == 100
+assert not list((root / "local_staging").iterdir())  # staging is left clean
+```
+
+Parquet encoding and the fsync happen on local disk. Publishing then copies the
+finished file to a temp *beside* the target and renames it there — two steps,
+because **a rename cannot cross volumes** (`os.replace` raises `EXDEV` rather
+than silently copying). The rename within the share is still atomic, so a reader
+never sees a partial file.
+
+Two things staging does *not* fix: reads still go to the share, and on Windows
+the final rename can be refused while anything holds the target open — DFS
+Replication, an indexer, antivirus. `replace_attempts` retries through that.
+
+## When a column comes back empty
+
+A batch where a column was entirely null says nothing about that column's type,
+but something still has to name a dtype — and what gets named is an accident of
+the boundary. So an all-null column takes whatever type is already stored:
+
+```python
+nulls = TimeseriesCache(MemoryBackend())
+nulls.write(bars(2), ticker="AAPL")  # close: Float64
+
+blank = pl.DataFrame(
+    {"ts": [BASE + timedelta(days=5)], "close": [None]},
+    schema={"ts": TS, "close": pl.String},  # what pandas' object dtype arrives as
+)
+nulls.write(
+    blank, start=BASE + timedelta(days=5), end=BASE + timedelta(days=5), ticker="AAPL"
+)
+
+out = nulls.read(ticker="AAPL").frame
+assert out.schema["close"] == pl.Float64
+assert out["close"].to_list() == [100.0, 101.0, None]
+```
+
+Where nothing is stored yet the column is kept as `Null` — honestly *not yet
+known* — and the first write carrying values settles it. Both directions are
+lossless: casting an all-null column invents nothing and destroys nothing.
+
+That is also where it stops. **A column with values is never cast**, because a
+lenient cast would turn `"cheap"` into `null` without a word:
+
+```python
+import pytest
+
+from timeseries_cache import SchemaMismatchError
+
+real = pl.DataFrame(
+    {"ts": [BASE + timedelta(days=6)], "close": ["cheap"]},
+    schema={"ts": TS, "close": pl.String},
+)
+with pytest.raises(SchemaMismatchError):
+    nulls.write(real, ticker="AAPL")
+```
+
 ## Durability
 
 Data and manifest are written to temp files and atomically renamed, ordered so
