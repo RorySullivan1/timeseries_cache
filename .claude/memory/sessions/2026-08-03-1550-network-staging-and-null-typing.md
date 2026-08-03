@@ -63,7 +63,8 @@ pass silently is data loss, not a relaxation.
   (all-null casts are lossless), not because conforming sounds tidy.
 
 ## State at end
-- PR #5 open, 379 tests, ruff + mypy clean on 3.11/3.13, CI running 3×2.
+- PR #5 merged as `0812fdc` (squash); all six CI jobs green. 379 tests, ruff +
+  mypy clean; main re-verified after the merge. Local branch deleted.
 - `staging_dir`, `replace_attempts`, `replace_backoff` documented in
   `python/README.md` and tutorial 05; null-typing rule in CLAUDE.md, README, and
   tutorial 05.

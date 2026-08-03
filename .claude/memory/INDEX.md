@@ -2,7 +2,7 @@
 
 ## State            (rewrite in place — current truth only, ≤ ~10 lines)
 - `python/` is complete: 379 tests green, ruff + `mypy --strict` clean on 3.11/3.12/3.13. No other language port.
-- PRs #1-#4 merged; **PR #5 open** on `claude/network-share-retry` (local staging + rename retry + null typing).
+- PRs #1-#5 all merged; main = `0812fdc`, verified green after merge. No branch in flight.
 - CI matrix is 3.11/3.12/3.13 × ubuntu/windows. Tutorials are markdown under `python/tutorials/`.
 - Row identity is `(timestamp, *identity_columns)`; default `()` = timestamp alone, unchanged behavior.
 - Remote branch deletion returns 403 from this environment's git proxy — must be done in the GitHub UI.
