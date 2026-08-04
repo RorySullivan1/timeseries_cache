@@ -119,10 +119,10 @@ cache.write(corrected, start=t0, end=t1, mode="replace_window", **series)
   `int`, `float`, `bool`, `None`, `date`, `datetime`, `Decimal`, `Enum`, and
   lists/tuples of those. `start`, `end`, `mode`, `columns`, and `frame` are
   reserved for control parameters.
-- A write lands completely or not at all. Growing updates write data first and
-  the manifest last; `delete`, which *shrinks* what is claimed, writes the
-  manifest first. Either way an interruption leaves the cache under-claiming, so
-  the cost is a refetch — never coverage claiming rows that aren't there.
+- A write lands completely or not at all. Each one publishes a new numbered
+  generation rather than replacing files in place, so an interruption leaves the
+  cache under-claiming — the cost is a refetch, never coverage claiming rows that
+  aren't there.
 - Cache kwargs canonicalize to JSON before hashing, so no value can forge its
   way into another kwarg's slot no matter what characters it contains.
 - **The stored dtypes are the key's schema**, and an incoming column conforms to
@@ -230,9 +230,14 @@ requires importing polars.
 ## Layout
 
 ```
-<root>/<shard>/<digest>/manifest.json   # kwargs, coverage intervals, schema
-<root>/<shard>/<digest>/data.parquet
+<root>/<shard>/<digest>/manifest-00000007.json   # kwargs, coverage, schema
+<root>/<shard>/<digest>/data-00000007.parquet
 ```
+
+**Nothing is ever renamed or overwritten.** Each write creates the next
+generation and a reader uses the newest manifest that parses; superseded
+generations are deleted afterwards, best-effort. See
+[Network and DFS shares](#network-and-dfs-shares) for why.
 
 The manifest keeps the kwargs verbatim, so a cache directory is self-describing
 and a digest collision surfaces as an error rather than one series quietly
@@ -281,85 +286,67 @@ below.
 
 ## Network and DFS shares
 
-If `root` is a UNC path or a mapped network drive, the cache **stages the build
-on local disk automatically** — nothing to configure:
+Writes work on a share, including one you cannot delete from. That is the point
+of the generational layout, and it took four production failures to arrive at.
+
+**Publishing by rename doesn't survive a share.** It is the textbook way to make
+a write atomic, and it needs the target to be (1) unheld by every other process,
+(2) deletable — replacing a file *is* deleting one — and (3) on the same volume
+as the temp. A share is entitled to refuse all three: DFS Replication, the
+server's indexer, antivirus and other clients hold files open; a corporate ACL of
+"create and write, but not delete" is common; and staging the build on local disk
+puts it on another volume by construction.
+
+**Creating a file needs none of that.** So a write lays down
+`data-<n>.parquet`, then `manifest-<n>.json`, both under names nothing is
+looking at yet. The generation becomes real the instant the manifest lands.
+
+That gives three properties worth stating plainly:
+
+- **A partial write is invisible rather than corrupting.** Nothing reads
+  `data-<n>` until `manifest-<n>` parses, and an interrupted manifest doesn't
+  parse — so readers skip that generation and the previous one still serves.
+- **Cleanup is allowed to fail.** Old generations are removed best-effort. A
+  share that refuses the delete costs disk space, never a write.
+- **Only create permission is required.** Delete rights are a nice-to-have.
+
+The cost is two live generations per key: the previous one is kept until the next
+write so a reader mid-scan isn't pulled out from under.
+
+### Staging keeps encoding and fsync off the wire
+
+If `root` is a UNC path or a mapped network drive, the cache builds each file on
+local disk first — automatically, nothing to configure:
 
 ```python
 cache = open_cache(r"\\server\share\cache")  # staged under the system temp dir
 ```
 
-Parquet encoding and the fsync then happen on local disk, and only finished
-bytes cross the wire — as one streamed copy rather than the many small writes
-encoding otherwise pushes over SMB.
+Only finished bytes cross, as one streamed copy landing directly under its final
+name. **The fsync is the part that matters**: a network redirector is entitled to
+refuse `os.fsync` outright, and SMB and DFS both do on some servers, which turns
+an ordinary write into `OSError: [Errno 9] Bad file descriptor`. Building locally
+moves that call onto a filesystem that answers it.
 
-**The fsync is the part that matters.** A network redirector is entitled to
-refuse `os.fsync` outright, and SMB and DFS both do on some servers — which
-turns an ordinary write into `OSError: [Errno 9] Bad file descriptor`. Building
-locally moves that call onto a filesystem that answers it.
-
-Detection is Windows-only and conservative: a UNC path, or a drive letter that
-`GetDriveTypeW` reports as remote. Anything it can't classify is treated as
-local, so a local cache keeps its free same-volume rename. Override either way:
+Detection is Windows-only and conservative — a UNC path, or a drive letter
+`GetDriveTypeW` reports as remote. Anything it can't classify counts as local.
+Override either way:
 
 ```python
 open_cache(share, staging_dir=r"C:\temp")  # choose the directory yourself
-open_cache(share, staging_dir=None)  # always build beside the target
+open_cache(share, staging_dir=None)  # always write in place
 ```
 
-Publishing still takes two steps, because **a rename cannot cross volumes**:
-`os.replace` fails rather than silently copying. So the finished file is
-copied to a temp *beside* the target and renamed there. Readers still only ever
-see the whole old file or the whole new one — the copy lands under a name
-nothing looks for, and the rename within the share is atomic as always.
+The flush of the copy that lands on the share is best-effort — its source was
+already durable locally, and nothing reads the file until its manifest exists.
+The build-side flush is strict, because that is where durability is established;
+if it fails, the error names `staging_dir` and `fsync=False` rather than leaving
+you with a bare errno.
 
-```
-staging_dir/  build ──fsync──►  finished file
-                                     │  one streamed copy
-share/        .data.parquet.tmp ◄────┘
-                     │  atomic rename, same volume
-              data.parquet
-```
-
-### The rename can still be refused
-
-On Windows a file cannot be replaced while *anything* holds it open, and on a
-share plenty of things transiently do: DFS Replication, the file server's
-indexer, antivirus, another client that just read the same key. The rename
-retries with backoff to ride those out:
-
-```python
-ParquetBackend(root, replace_attempts=5, replace_backoff=0.1)  # ~1.5s of trying
-```
-
-Raise `replace_attempts` if your share is slow to let go. If it fails on *every*
-attempt, the holder is permanent rather than transient — the error says so, and
-the usual causes are:
-
-- **No delete rights.** Replacing a file needs delete permission on it, or
-  delete-child on its directory. A share ACL'd "create and write, but not
-  delete" — a common corporate default — lets every step of a write succeed
-  except the rename, and blocks cleaning up the temp file too. No library
-  change can work around this; the directory needs Modify.
-- **Another writer.** See the single-writer limitation below. On a shared drive
-  that stops being hypothetical.
-
-### Durability on a share is best-effort, by necessity
-
-The copy that lands beside the target is fsync'd where the share allows it and
-**not** where it refuses — a refusal there costs crash-durability the share
-never really offered, and failing the write over it would make a share unusable
-for nothing. What makes the update atomic is the rename, not that call, and the
-bytes were already flushed on local disk before crossing.
-
-The build-side fsync is the opposite: strict, because that is where the data is
-actually made durable. If it fails, the error names `staging_dir` and
-`fsync=False` rather than leaving you with a bare `Bad file descriptor`.
-
-**Staging fixes the write path, not the read path.** Reads still go straight to
-the share, and the row-group skipping the cache is tuned around gives back much
-less over a network. If a shared cache is a convenience rather than a
-requirement, a local `root` is faster in both directions — cache locally,
-publish results to the share.
+**Reads are not improved by any of this.** They still go to the share, and the
+row-group skipping the cache is tuned around gives back much less over a network.
+If a shared cache is a convenience rather than a requirement, a local `root` is
+faster in both directions — cache locally, publish results to the share.
 
 ## Known limitations
 

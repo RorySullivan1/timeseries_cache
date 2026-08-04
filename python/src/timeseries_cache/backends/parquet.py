@@ -1,16 +1,46 @@
 """Local-filesystem parquet backend — the default.
 
-Layout, sharded by the digest's first byte so a cache with many keys does not
-build one enormous directory::
+**Nothing here is ever renamed or replaced.** Each write creates a new numbered
+generation and the newest valid manifest is what a reader uses::
 
-    <root>/<shard>/<digest>/manifest.json
-    <root>/<shard>/<digest>/data.parquet
+    <root>/<shard>/<digest>/manifest-00000007.json
+    <root>/<shard>/<digest>/data-00000007.parquet
+
+That is the whole design, and it exists because the obvious alternative does not
+work everywhere. Publishing by rename is the textbook way to make a write
+atomic, and it needs the target to be replaceable — which on Windows means
+unheld by every other process, and on a network or DFS share means the
+redirector agreeing to a same-volume rename it is entitled to refuse
+(``ERROR_NOT_SAME_DEVICE``) and an ACL granting delete, since replacing a file
+*is* deleting one. A cache that stops working when any of those is missing is
+not a robust cache.
+
+Creating a file needs none of that. So:
+
+* **Publishing is a create.** A new generation's data file is written under a
+  name nothing is looking for yet, and the generation becomes real the instant
+  its manifest file exists.
+* **A half-written file is invisible, not corrupting.** Readers only consult
+  ``data-N`` once ``manifest-N`` parses, and a truncated manifest does not
+  parse, so an interrupted write leaves a generation that is skipped rather
+  than one that lies.
+* **The write-ordering rule disappears.** ``manifest_first`` mattered when a
+  key's single pair of files was mutated in place; here nothing existing is
+  touched, so growing and shrinking updates publish identically and both
+  under-claim on a crash.
+* **Cleanup is optional.** Old generations are deleted best-effort. A share that
+  refuses the delete — locked file, no delete rights — costs disk space, never
+  a failed write. This is the property that makes the cache usable on a share
+  ACL'd "create and write, but not delete".
+
+The cost is that a key briefly occupies two generations, since the previous one
+is kept until the next write to keep readers that are mid-scan safe.
 """
 
 from __future__ import annotations
 
 import contextlib
-import errno
+import json
 import os
 import shutil
 import tempfile
@@ -26,8 +56,28 @@ from ..keys import CacheKey
 
 ParquetCompression = Literal["lz4", "uncompressed", "snappy", "gzip", "brotli", "zstd"]
 
-MANIFEST_NAME = "manifest.json"
-DATA_NAME = "data.parquet"
+MANIFEST_PREFIX: Final[str] = "manifest-"
+MANIFEST_SUFFIX: Final[str] = ".json"
+DATA_PREFIX: Final[str] = "data-"
+DATA_SUFFIX: Final[str] = ".parquet"
+GENERATION_DIGITS: Final[int] = 8
+"""Zero-padded so a plain directory listing sorts chronologically."""
+
+LEGACY_MANIFEST: Final[str] = "manifest.json"
+LEGACY_DATA: Final[str] = "data.parquet"
+"""The pre-generational layout, read as generation 0.
+
+Caches written by an earlier build keep working and migrate on their next write.
+"""
+
+KEEP_GENERATIONS: Final[int] = 1
+"""How many superseded generations to leave behind.
+
+One, not zero. A reader that has just resolved generation N and not yet opened
+its parquet file would race a writer deleting N the moment N+1 lands; keeping
+the previous generation makes that window harmless. Two live generations is the
+price of never renaming.
+"""
 
 DEFAULT_ROW_GROUP_SIZE: Final[int] = 64_000
 """Rows per parquet row group.
@@ -41,47 +91,27 @@ reads get worse, so this is near the knee rather than as small as possible.
 """
 
 STAGING_SUBDIR: Final[str] = "timeseries_cache_staging"
-"""Directory under the system temp dir used when staging is chosen for you.
-
-A named subdirectory rather than the temp root, so a half-finished build after a
-hard kill is identifiable and sweepable rather than being one more anonymous
-``.tmp`` among everything else on the machine.
-"""
+"""Directory under the system temp dir used when staging is chosen for you."""
 
 DRIVE_REMOTE: Final[int] = 4
 """``GetDriveTypeW`` result for a network drive. From winbase.h; hardcoded
 rather than pulled from pywin32, which the core deliberately does not depend on.
 """
 
-ERROR_NOT_SAME_DEVICE: Final[int] = 17
-"""Windows' cross-volume rename refusal — "cannot move the file to a different
-disk drive".
+DEFAULT_CREATE_ATTEMPTS: Final[int] = 5
+DEFAULT_CREATE_BACKOFF: Final[float] = 0.1
+"""Retry budget for creating a file.
 
-It has to be checked *by winerror*, not by ``errno``. Python does not
-necessarily translate it to ``EXDEV``, so an ``errno``-only test silently misses
-the exact case the fallback exists for — and it misses it only on Windows,
-against a share, which is precisely where it cannot be caught locally.
-"""
-
-DEFAULT_REPLACE_ATTEMPTS: Final[int] = 5
-DEFAULT_REPLACE_BACKOFF: Final[float] = 0.1
-"""Retry budget for the final rename.
-
-POSIX never needs this — a file there can be replaced while open. Windows
-cannot, and on a network or DFS share the set of things that transiently hold a
-file open is large and outside your control: DFS Replication, the file server's
-indexer, antivirus, another client that just read the same key. Those clear in
-milliseconds, so a short bounded retry converts a hard failure into a pause.
-
-Bounded on purpose. A genuine permission problem should still surface quickly
-rather than being buried under a minute of retries, and retrying cannot corrupt
-anything: ``os.replace`` either happened or it didn't, and the source file is
-still there either way.
+Much less load-bearing than the rename retry it replaces — a create does not
+contend with readers of an existing file — but a share still hands out
+transient sharing violations from antivirus, indexers, and DFS Replication, and
+riding those out is cheap. Retrying a create is safe because the name is unique
+to this generation: nothing else is entitled to it.
 """
 
 
 class ParquetBackend:
-    """Stores each key as a parquet file plus a JSON manifest.
+    """Stores each key as numbered parquet + manifest generations.
 
     Args:
         root: Directory to store the cache under.
@@ -91,34 +121,22 @@ class ParquetBackend:
             ``"lz4"`` if writes dominate your workload.
         row_group_size: See :data:`DEFAULT_ROW_GROUP_SIZE`. Lower it if reads
             are consistently narrow, raise it if they are consistently wide.
-        fsync: Flush file contents and directory entries before returning.
-            Disabling it is faster (~24ms per write on the machine this was
-            measured on) but gives up the crash guarantee in invariant 5: after
-            a power loss the manifest may be durable while its rows are not.
-        replace_attempts: How many times to try the final rename before giving
-            up. Only relevant on Windows, where a file cannot be replaced while
-            anything holds it open — and on a network or DFS share plenty of
-            things transiently do: DFS Replication, the server's indexer,
-            antivirus, another client. Each retry backs off, doubling from
-            ``replace_backoff``. Set to 1 to fail immediately.
-        replace_backoff: Seconds before the second attempt, doubling thereafter.
-            The default gives up after roughly 1.5s of trying.
-        staging_dir: Where to build a file before publishing it.
+        fsync: Flush file contents before a generation is published. Disabling
+            it is faster but gives up the crash guarantee: after a power loss a
+            manifest may be durable while its rows are not.
+        create_attempts: How many times to retry creating a file before giving
+            up, for shares that hand out transient sharing violations. Set to 1
+            to fail immediately.
+        create_backoff: Seconds before the second attempt, doubling thereafter.
+        staging_dir: Where to build a file before copying it into place.
 
-            ``"auto"`` (the default) stages on local disk when ``root`` looks
-            like a network or DFS share, and builds beside the target otherwise.
-            A local cache is therefore unaffected — its rename stays a
-            same-volume metadata operation with nothing to copy — while a share
-            gets the local build without anyone having to know to ask for it.
-
-            Staging is what keeps parquet encoding *and the fsync* off the wire.
-            Only the finished bytes cross, as one streamed copy rather than the
-            many small writes encoding would otherwise push over SMB. Publishing
-            still lands a temp beside the target and renames it there, because a
-            rename cannot cross volumes; see :meth:`_publish`.
+            ``"auto"`` (the default) builds on local disk when ``root`` looks
+            like a network or DFS share, and writes in place otherwise. Staging
+            keeps parquet encoding *and the fsync* off the wire; only finished
+            bytes cross, as one streamed copy.
 
             Pass a path to choose the directory yourself (``r"C:\\temp"``), or
-            ``None`` to force building beside the target even on a share.
+            ``None`` to always write in place.
     """
 
     def __init__(
@@ -128,19 +146,21 @@ class ParquetBackend:
         compression: ParquetCompression = "zstd",
         row_group_size: int | None = DEFAULT_ROW_GROUP_SIZE,
         fsync: bool = True,
-        replace_attempts: int = DEFAULT_REPLACE_ATTEMPTS,
-        replace_backoff: float = DEFAULT_REPLACE_BACKOFF,
+        create_attempts: int = DEFAULT_CREATE_ATTEMPTS,
+        create_backoff: float = DEFAULT_CREATE_BACKOFF,
         staging_dir: str | os.PathLike[str] | Literal["auto"] | None = "auto",
     ) -> None:
-        if replace_attempts < 1:
-            raise ValueError("replace_attempts must be at least 1")
+        if create_attempts < 1:
+            raise ValueError("create_attempts must be at least 1")
         self.root = Path(root)
         self.compression = compression
         self.row_group_size = row_group_size
         self.fsync = fsync
-        self.replace_attempts = replace_attempts
-        self.replace_backoff = replace_backoff
+        self.create_attempts = create_attempts
+        self.create_backoff = create_backoff
         self.staging_dir = self._resolve_staging_dir(staging_dir, self.root)
+
+    # ------------------------------------------------------------- placement
 
     @classmethod
     def _resolve_staging_dir(
@@ -150,10 +170,8 @@ class ParquetBackend:
     ) -> Path | None:
         """Turn the ``staging_dir`` argument into a directory, or ``None``.
 
-        ``"auto"`` is the only interesting case: stage locally exactly when the
-        root looks remote. Staging a *local* cache would be a pessimisation —
-        it turns a free same-volume rename into a full copy whenever the system
-        temp dir sits on a different volume from the cache.
+        ``"auto"`` stages locally exactly when the root looks remote. Staging a
+        local cache would only add a copy.
         """
         if staging_dir == "auto":
             if not cls._looks_remote(root):
@@ -166,14 +184,8 @@ class ParquetBackend:
         """Whether ``root`` appears to live on a network or DFS share.
 
         Two shapes on Windows, and both matter because callers use both: a UNC
-        path (``\\\\server\\share\\...``), and a mapped drive letter, which looks
-        local until you ask the OS. ``GetDriveTypeW`` is the ask, reached
-        through ``ctypes`` rather than pywin32 — this backend is meant to work
-        on a bare interpreter.
-
-        Deliberately conservative: anything it cannot classify is treated as
-        local, so the answer to an unexpected path shape is the behavior the
-        cache has always had rather than a surprise copy on every write.
+        path, and a mapped drive letter, which looks local until you ask the OS.
+        Deliberately conservative — anything unclassifiable is treated as local.
         """
         if os.name != "nt":  # pragma: no cover - exercised on the Windows CI job
             return False
@@ -189,28 +201,109 @@ class ParquetBackend:
         try:  # pragma: no cover - Windows-only
             import ctypes
 
-            # getattr, not `ctypes.windll`, and not a `type: ignore` either:
-            # `windll` is absent from the stubs off Windows and present on it,
-            # so a literal attribute access needs an ignore that mypy then
-            # flags as *unused* on the one platform this code runs. getattr is
-            # the spelling that type-checks the same way on both.
+            # getattr, not `ctypes.windll`: `windll` is absent from the stubs
+            # off Windows and present on it, so a literal attribute access needs
+            # an ignore that mypy then flags as *unused* on the one platform
+            # this runs.
             windll = getattr(ctypes, "windll")  # noqa: B009
             return bool(windll.kernel32.GetDriveTypeW(f"{drive}\\") == DRIVE_REMOTE)
         except Exception:  # pragma: no cover - defensive
             return False
 
+    # ------------------------------------------------------------ generations
+
     def _dir(self, key: CacheKey) -> Path:
         return self.root / key.shard / key.digest
 
-    def read_manifest(self, key: CacheKey) -> Manifest | None:
-        path = self._dir(key) / MANIFEST_NAME
-        if not path.exists():
+    @staticmethod
+    def _manifest_path(directory: Path, generation: int) -> Path:
+        if generation == 0:
+            return directory / LEGACY_MANIFEST
+        stamp = str(generation).zfill(GENERATION_DIGITS)
+        return directory / f"{MANIFEST_PREFIX}{stamp}{MANIFEST_SUFFIX}"
+
+    @staticmethod
+    def _data_path(directory: Path, generation: int) -> Path:
+        if generation == 0:
+            return directory / LEGACY_DATA
+        stamp = str(generation).zfill(GENERATION_DIGITS)
+        return directory / f"{DATA_PREFIX}{stamp}{DATA_SUFFIX}"
+
+    @staticmethod
+    def _generations(directory: Path) -> list[int]:
+        """Every generation with a manifest file, newest first.
+
+        Name-based rather than content-based: finding the candidates must not
+        cost a read of each one.
+        """
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            return []
+        found: list[int] = []
+        for entry in entries:
+            name = entry.name
+            if not (
+                name.startswith(MANIFEST_PREFIX) and name.endswith(MANIFEST_SUFFIX)
+            ):
+                continue
+            token = name[len(MANIFEST_PREFIX) : -len(MANIFEST_SUFFIX)]
+            if token.isdigit():
+                found.append(int(token))
+        return sorted(found, reverse=True)
+
+    @staticmethod
+    def _load(path: Path) -> Manifest | None:
+        """Read a manifest, or ``None`` if this generation is not real.
+
+        "Not real" covers the file being absent and the file being incomplete.
+        The second is the important one and is what replaces the atomic rename:
+        a manifest interrupted mid-write cannot parse as JSON — the closing
+        brace is what is missing — so the generation is skipped and the reader
+        falls back to the previous one.
+
+        Only structural failures are swallowed. A manifest from a *future*
+        format version is a real error and still raises: guessing at a layout
+        this build does not understand is how a cache silently serves wrong
+        data.
+        """
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
             return None
-        return Manifest.from_json(path.read_text(encoding="utf-8"))
+        try:
+            return Manifest.from_json(raw)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+            if isinstance(error, ValueError) and "format_version" in str(error):
+                raise
+            return None
+
+    def _current(self, directory: Path) -> tuple[int, Manifest] | None:
+        """The newest generation whose manifest is complete."""
+        for generation in self._generations(directory):
+            manifest = self._load(self._manifest_path(directory, generation))
+            if manifest is not None:
+                return generation, manifest
+        legacy = self._load(directory / LEGACY_MANIFEST)
+        if legacy is not None:
+            return 0, legacy
+        return None
+
+    # -------------------------------------------------------------- protocol
+
+    def read_manifest(self, key: CacheKey) -> Manifest | None:
+        current = self._current(self._dir(key))
+        return current[1] if current is not None else None
 
     def scan(self, key: CacheKey) -> pl.LazyFrame | None:
-        path = self._dir(key) / DATA_NAME
+        directory = self._dir(key)
+        current = self._current(directory)
+        if current is None:
+            return None
+        path = self._data_path(directory, current[0])
         if not path.exists():
+            # A generation with no data file is a schema-less empty write: the
+            # coverage claim is the whole content.
             return None
         return pl.scan_parquet(path)
 
@@ -222,291 +315,37 @@ class ParquetBackend:
         *,
         manifest_first: bool = False,
     ) -> None:
+        """Publish a new generation.
+
+        ``manifest_first`` is accepted for the protocol and deliberately unused.
+        It exists to order the two halves of an in-place update so the
+        interruptible middle state under-claims; publishing a fresh generation
+        has no such middle state, because nothing is visible until the manifest
+        lands and the manifest is always last. Growing and shrinking updates are
+        therefore the same operation here.
+        """
         directory = self._dir(key)
         directory.mkdir(parents=True, exist_ok=True)
 
-        def write_data(tmp: Path) -> None:
-            frame.write_parquet(
-                tmp,
-                compression=self.compression,
-                row_group_size=self.row_group_size,
+        current = self._current(directory)
+        generation = self._next_generation(directory, current[0] if current else 0)
+
+        if frame.width:
+            self._create(
+                self._data_path(directory, generation),
+                lambda tmp: frame.write_parquet(
+                    tmp,
+                    compression=self.compression,
+                    row_group_size=self.row_group_size,
+                ),
             )
 
         def write_manifest(tmp: Path) -> None:
             tmp.write_text(manifest.to_json(), encoding="utf-8")
 
-        def put_data() -> None:
-            if frame.width:
-                self._atomic_write(
-                    directory / DATA_NAME,
-                    write_data,
-                    fsync=self.fsync,
-                    attempts=self.replace_attempts,
-                    backoff=self.replace_backoff,
-                    staging_dir=self.staging_dir,
-                )
-            else:
-                # A schema-less empty write: there is no frame to store, only a
-                # coverage claim. Drop any stale data file rather than leave rows
-                # the manifest no longer describes.
-                (directory / DATA_NAME).unlink(missing_ok=True)
-
-        def put_manifest() -> None:
-            self._atomic_write(
-                directory / MANIFEST_NAME,
-                write_manifest,
-                fsync=self.fsync,
-                attempts=self.replace_attempts,
-                backoff=self.replace_backoff,
-                staging_dir=self.staging_dir,
-            )
-
-        # Order matters, and which order is safe depends on direction — see the
-        # module docstring in base.py. Both orders leave an interruptible middle
-        # state that under-claims.
-        if manifest_first:
-            put_manifest()
-            put_data()
-        else:
-            put_data()
-            put_manifest()
-
-    @staticmethod
-    def _flush(path: Path) -> None:
-        """Force a file's contents to storage.
-
-        Opened ``"r+b"``, not ``"rb"``: the descriptor handed to fsync must be
-        *writable*. POSIX permits fsync on a read-only descriptor, but on Windows
-        ``os.fsync`` is ``_commit()``, which rejects a read-only CRT handle with
-        EBADF — "Bad file descriptor" — so a read-only open works everywhere
-        except the platform most likely to be running it. ``r+b`` also avoids
-        truncating what ``produce`` just wrote.
-        """
-        with open(path, "r+b") as written:
-            written.flush()
-            os.fsync(written.fileno())
-
-    @staticmethod
-    def _atomic_write(
-        target: Path,
-        produce: Callable[[Path], None],
-        *,
-        fsync: bool = True,
-        attempts: int = DEFAULT_REPLACE_ATTEMPTS,
-        backoff: float = DEFAULT_REPLACE_BACKOFF,
-        staging_dir: Path | None = None,
-    ) -> None:
-        """Build a file, then put it in place without ever exposing a partial one.
-
-        The rename is the atomic step: a reader sees either the whole old file
-        or the whole new one, never a half-written parquet. The directory fsync
-        afterwards is what makes the rename itself survive a power loss —
-        without it the ordering guarantee holds only against a process crash,
-        not against the machine going down.
-
-        With ``staging_dir`` set the file is *built* there — encoded and flushed
-        on local disk — and only the finished bytes cross to ``target``. See
-        :meth:`_publish` for why that still cannot be a single rename.
-        """
-        build_dir = staging_dir if staging_dir is not None else target.parent
-        build_dir.mkdir(parents=True, exist_ok=True)
-        descriptor, name = tempfile.mkstemp(
-            dir=build_dir, prefix=f".{target.name}.", suffix=".tmp"
-        )
-        os.close(descriptor)
-        tmp_path = Path(name)
-        try:
-            produce(tmp_path)
-            if fsync:
-                try:
-                    ParquetBackend._flush(tmp_path)
-                except OSError as error:
-                    # Strict, unlike the publish-side flush: this is where the
-                    # bytes are actually made durable. But say what to do about
-                    # it — a build directory that refuses fsync is a share, and
-                    # the fix is to build somewhere that doesn't.
-                    raise OSError(
-                        f"could not flush {tmp_path.name} in {build_dir}: "
-                        f"{error}. A filesystem that refuses fsync is almost "
-                        "always a network or DFS share; build on local disk "
-                        'instead (staging_dir=r"C:\\temp", or leave it "auto" '
-                        "to have a local directory chosen when the root looks "
-                        "remote), or pass fsync=False to give up the crash "
-                        "guarantee deliberately."
-                    ) from error
-            ParquetBackend._publish(
-                tmp_path, target, attempts=attempts, backoff=backoff, fsync=fsync
-            )
-            if fsync:
-                ParquetBackend._fsync_dir(target.parent)
-        except BaseException:
-            # Suppressed: on Windows, unlinking a file that still has an open
-            # handle raises PermissionError, and an exception raised *inside* an
-            # except block replaces the one being handled. Without this, a
-            # failed cleanup hides whatever actually went wrong — you get
-            # "permission denied" on a temp file instead of the real cause.
-            with contextlib.suppress(OSError):
-                tmp_path.unlink(missing_ok=True)
-            raise
-
-    @staticmethod
-    def _is_cross_volume(error: OSError) -> bool:
-        """Whether a failed rename failed *because* it would cross volumes.
-
-        Two spellings of one condition, and both are needed. POSIX raises
-        ``EXDEV``. Windows raises ``ERROR_NOT_SAME_DEVICE`` — "cannot move the
-        file to a different disk drive" — and does not reliably translate it
-        into ``EXDEV``, so an errno-only test lets the very case this fallback
-        exists for escape as a hard error.
-
-        That combination is unreachable from a POSIX test runner and only
-        reachable on Windows with a build directory on another volume, i.e. a
-        network share with staging on: the exact configuration that cannot be
-        exercised anywhere but a real deployment. So it is checked defensively
-        rather than by whichever spelling one platform happened to produce.
-        """
-        return (
-            error.errno == errno.EXDEV
-            or getattr(error, "winerror", None) == ERROR_NOT_SAME_DEVICE
-        )
-
-    @staticmethod
-    def _publish(
-        built: Path,
-        target: Path,
-        *,
-        attempts: int = DEFAULT_REPLACE_ATTEMPTS,
-        backoff: float = DEFAULT_REPLACE_BACKOFF,
-        fsync: bool = True,
-    ) -> None:
-        """Move a finished file onto ``target``, atomically.
-
-        A rename is atomic but cannot cross volumes — it fails rather than
-        silently copying — so when the file was built on local disk and the
-        cache lives on a network share, publishing takes two steps: stream it to
-        a temp file *beside* the target, then rename within that volume. Readers
-        still only ever see the whole old file or the whole new one; the copy
-        lands under a name nothing looks for.
-
-        Same-volume builds skip the copy entirely and rename directly.
-        """
-        try:
-            ParquetBackend._replace(built, target, attempts=attempts, backoff=backoff)
-            return
-        except OSError as error:
-            if not ParquetBackend._is_cross_volume(error):
-                raise
-
-        descriptor, name = tempfile.mkstemp(
-            dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
-        )
-        os.close(descriptor)
-        landed = Path(name)
-        try:
-            # One streamed copy of a finished file, rather than the many small
-            # writes parquet encoding would otherwise push across the wire.
-            shutil.copyfile(built, landed)
-            if fsync:
-                # Best-effort *here specifically*, unlike the build-side flush.
-                # This file is on the far side of the wire, and a network
-                # redirector is entitled to refuse fsync outright — SMB and DFS
-                # both do, with EBADF or EINVAL depending on the server. Failing
-                # the write over that would make a share unusable while losing
-                # nothing real: the bytes came from a source already flushed to
-                # local disk, and what makes the update atomic is the rename
-                # below, not this call. So a refusal costs crash-durability on
-                # the share — which the share never actually offered — rather
-                # than the write.
-                with contextlib.suppress(OSError):
-                    ParquetBackend._flush(landed)
-            ParquetBackend._replace(landed, target, attempts=attempts, backoff=backoff)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                landed.unlink(missing_ok=True)
-            raise
-        finally:
-            with contextlib.suppress(OSError):
-                built.unlink(missing_ok=True)
-
-    @staticmethod
-    def _replace(
-        source: Path,
-        target: Path,
-        *,
-        attempts: int = DEFAULT_REPLACE_ATTEMPTS,
-        backoff: float = DEFAULT_REPLACE_BACKOFF,
-    ) -> None:
-        """Atomically move ``source`` onto ``target``, retrying transient locks.
-
-        POSIX replaces an open file happily — the old inode survives until its
-        last handle closes — so the retry never engages there. Windows refuses
-        while anything holds the target open, and on a network or DFS share the
-        holder is often a service you don't control and that lets go a moment
-        later.
-
-        On exhaustion the error carries the attempt count and elapsed time,
-        because *which* it was matters: failing every attempt over 1.5s points
-        at a permanent holder or a permission problem, while succeeding on a
-        later attempt points at a transient one.
-        """
-        delay = backoff
-        started = time.monotonic()
-        last: OSError | None = None
-
-        for attempt in range(1, attempts + 1):
-            try:
-                os.replace(source, target)
-                return
-            except PermissionError as error:
-                # Covers both WinError 5 (access denied) and 32 (sharing
-                # violation); Python maps both onto PermissionError.
-                last = error
-                if attempt == attempts:
-                    break
-                time.sleep(delay)
-                delay *= 2
-
-        elapsed = time.monotonic() - started
-        raise PermissionError(
-            f"could not move {source.name} onto {target.name} after "
-            f"{attempts} attempt(s) over {elapsed:.1f}s: {last}. "
-            "On Windows a file cannot be replaced while anything holds it open. "
-            "Failing every attempt points at a permanent holder rather than a "
-            "transient one — a permission problem (replacing a file needs delete "
-            "rights on it, or delete-child on its directory), DFS Replication, "
-            "or another process with the file open. Raise replace_attempts if "
-            "the holder is slow rather than permanent."
-        ) from last
-
-    @staticmethod
-    def _fsync_dir(directory: Path) -> None:
-        """Persist a directory entry (the rename), where the platform allows it.
-
-        Entirely best-effort, and every step is guarded because platforms
-        disagree at every step: Windows cannot open a directory as a file at
-        all, macOS and several network filesystems accept the descriptor but
-        refuse to fsync it, and a descriptor left in an odd state by either can
-        make even the close fail. None of that should break a write that
-        otherwise succeeded — the durability this buys is a refinement on top of
-        the atomic rename, not something the write's correctness rests on.
-
-        The file fsync in ``_atomic_write`` is deliberately *not* guarded like
-        this. If that one fails, the data genuinely may not be on disk and the
-        caller needs to hear about it.
-        """
-        try:
-            descriptor = os.open(directory, os.O_RDONLY)
-        except OSError:  # pragma: no cover - platform-dependent
-            return  # e.g. Windows, where a directory has no file descriptor
-        try:
-            os.fsync(descriptor)
-        except OSError:  # pragma: no cover - platform-dependent
-            pass  # e.g. macOS and some network filesystems
-        finally:
-            # Guarded too: an unguarded close here turns a harmless
-            # platform quirk into a failed write.
-            with contextlib.suppress(OSError):
-                os.close(descriptor)
+        # Last, always: this is the step that makes the generation visible.
+        self._create(self._manifest_path(directory, generation), write_manifest)
+        self._cleanup(directory, generation)
 
     def delete(self, key: CacheKey) -> None:
         shutil.rmtree(self._dir(key), ignore_errors=True)
@@ -518,5 +357,149 @@ class ParquetBackend:
             if not shard.is_dir():
                 continue
             for entry in sorted(shard.iterdir()):
-                if (entry / MANIFEST_NAME).exists():
+                if self._generations(entry) or (entry / LEGACY_MANIFEST).exists():
                     yield entry.name
+
+    # ----------------------------------------------------------------- write
+
+    def _next_generation(self, directory: Path, current: int) -> int:
+        """The next free generation number.
+
+        Skips any number already taken, including one left by a writer whose
+        manifest is unparseable — reusing it would overwrite the evidence and,
+        worse, be a replace.
+        """
+        taken = set(self._generations(directory))
+        generation = max([current, *taken], default=0) + 1
+        while generation in taken:
+            generation += 1
+        return generation
+
+    def _create(self, target: Path, produce: Callable[[Path], None]) -> None:
+        """Put a file at ``target``, which must not already exist.
+
+        Either written straight there, or built in ``staging_dir`` and copied.
+        No rename either way: ``target`` carries a generation number nothing is
+        looking for yet, so a reader cannot see it half-written, and the file
+        only starts mattering once this generation's manifest exists.
+        """
+        if self.staging_dir is None:
+            self._attempt(lambda: self._produce_and_flush(target, produce, strict=True))
+            return
+
+        self.staging_dir.mkdir(parents=True, exist_ok=True)
+        descriptor, name = tempfile.mkstemp(
+            dir=self.staging_dir, prefix=f".{target.name}.", suffix=".tmp"
+        )
+        os.close(descriptor)
+        built = Path(name)
+        try:
+            # Encode and flush on local disk; only finished bytes cross the wire.
+            self._produce_and_flush(built, produce, strict=True)
+            self._attempt(lambda: self._copy_and_flush(built, target))
+        except BaseException:
+            with contextlib.suppress(OSError):
+                target.unlink(missing_ok=True)
+            raise
+        finally:
+            with contextlib.suppress(OSError):
+                built.unlink(missing_ok=True)
+
+    def _produce_and_flush(
+        self, target: Path, produce: Callable[[Path], None], *, strict: bool
+    ) -> None:
+        try:
+            produce(target)
+            if self.fsync:
+                self._flush(target, strict=strict)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                target.unlink(missing_ok=True)
+            raise
+
+    def _copy_and_flush(self, built: Path, target: Path) -> None:
+        try:
+            # One streamed copy of a finished file, rather than the many small
+            # writes parquet encoding would otherwise push across the wire.
+            shutil.copyfile(built, target)
+            if self.fsync:
+                self._flush(target, strict=False)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                target.unlink(missing_ok=True)
+            raise
+
+    def _attempt(self, action: Callable[[], None]) -> None:
+        """Run ``action``, riding out transient sharing violations."""
+        delay = self.create_backoff
+        last: OSError | None = None
+        for attempt in range(1, self.create_attempts + 1):
+            try:
+                action()
+                return
+            except PermissionError as error:
+                # WinError 5 (access denied) and 32 (sharing violation) both
+                # land here, and on a share both are usually momentary.
+                last = error
+                if attempt == self.create_attempts:
+                    break
+                time.sleep(delay)
+                delay *= 2
+        raise PermissionError(
+            f"could not create a file after {self.create_attempts} attempt(s): "
+            f"{last}. Unlike replacing a file, creating one needs no delete "
+            "rights — so this points at write permission on the directory, or "
+            "a scanner holding new files open. Raise create_attempts if the "
+            "holder is slow rather than permanent."
+        ) from last
+
+    @staticmethod
+    def _flush(path: Path, *, strict: bool) -> None:
+        """Force a file's contents to storage.
+
+        Opened ``"r+b"``, not ``"rb"``: the descriptor handed to fsync must be
+        *writable*. POSIX permits fsync on a read-only descriptor, but Windows'
+        ``os.fsync`` is ``_commit()``, which rejects a read-only handle with
+        EBADF.
+
+        ``strict`` distinguishes the two call sites, and they must not be
+        conflated. Flushing where the file is *built* establishes durability and
+        a failure there is real. Flushing a copy that has landed on a share is
+        best-effort: its source was already durable locally, nothing reads the
+        file until this generation's manifest exists, and a network redirector
+        is entitled to refuse fsync outright.
+        """
+        try:
+            with open(path, "r+b") as written:
+                written.flush()
+                os.fsync(written.fileno())
+        except OSError as error:
+            if not strict:
+                return
+            raise OSError(
+                f"could not flush {path.name} in {path.parent}: {error}. A "
+                "filesystem that refuses fsync is almost always a network or "
+                'DFS share; build on local disk instead (staging_dir=r"C:\\temp", '
+                'or leave it "auto"), or pass fsync=False to give up the crash '
+                "guarantee deliberately."
+            ) from error
+
+    def _cleanup(self, directory: Path, published: int) -> None:
+        """Drop superseded generations. Entirely best-effort.
+
+        A file that cannot be deleted — held open by a reader, or a share
+        without delete rights — costs disk space and nothing else. That is the
+        whole reason publishing is a create: cleanup is allowed to fail.
+        """
+        for generation in self._generations(directory):
+            if generation > published - 1 - KEEP_GENERATIONS:
+                continue
+            with contextlib.suppress(OSError):
+                self._manifest_path(directory, generation).unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                self._data_path(directory, generation).unlink(missing_ok=True)
+        if published > KEEP_GENERATIONS:
+            # The pre-generational pair, once it is far enough behind.
+            for legacy in (directory / LEGACY_MANIFEST, directory / LEGACY_DATA):
+                with contextlib.suppress(OSError):
+                    legacy.unlink(missing_ok=True)

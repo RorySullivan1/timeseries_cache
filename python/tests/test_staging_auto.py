@@ -1,21 +1,23 @@
-"""Staging a build on local disk, chosen for you when the root looks remote.
+"""Writing to a network or DFS share without ever renaming anything.
 
-Two failures on a real DFS share motivated this, and they are separate:
+Four rounds of failures on a real share drove this, and each one was a different
+way for the same idea to break: *publish by replacing the live file*. In order,
+they were an fsync on the share refused outright, an fsync on a read-only
+descriptor, a rename refused because Windows would not replace a held file, and
+a rename refused as ``ERROR_NOT_SAME_DEVICE`` when the build was staged onto
+another volume.
 
-1. Without staging, the temp file is built *beside the target* — on the share —
-   so parquet encoding and, worse, ``os.fsync`` run over the wire. A network
-   redirector may simply refuse the fsync, and the write dies. Callers had to
-   know to pass ``staging_dir`` to avoid it, which is knowledge the library
-   should have rather than the caller.
+Patching them one at a time was the mistake. Replacing a file needs the target
+to be unheld, deletable, and on the same volume — three things a share is
+entitled to deny — while *creating* a file needs none of them. So a write now
+publishes a new numbered generation and the newest valid manifest wins.
 
-2. Even *with* staging, the publish step fsync'd the copy it had just landed on
-   the share — so one network fsync survived the fix that was supposed to
-   eliminate it.
+What that buys, and what these tests hold:
 
-The rules below: ``"auto"`` stages locally exactly when the root looks remote
-(never for a local cache, where it would turn a free rename into a copy), the
-build-side fsync stays strict but explains itself, and the publish-side fsync
-is best-effort because the share never really offered durability anyway.
+* no rename or replace anywhere in the write path;
+* a half-written file is invisible rather than corrupting, because a generation
+  is not real until its manifest parses;
+* cleanup may fail freely — a share that refuses deletes costs disk, not writes.
 """
 
 from __future__ import annotations
@@ -27,16 +29,194 @@ from pathlib import Path
 
 import pytest
 
+from timeseries_cache import TimeseriesCache
 from timeseries_cache.backends.parquet import (
+    DATA_PREFIX,
+    MANIFEST_PREFIX,
     STAGING_SUBDIR,
     ParquetBackend,
 )
 
+from .conftest import frame, ts
+
+SERIES = {"ticker": "AAPL"}
+
+
+def only_key(root: Path) -> Path:
+    return next(root.glob("*/*"))
+
+
+class TestNothingIsEverRenamed:
+    """The property the whole layout exists for."""
+
+    def test_a_write_never_calls_os_replace(self, tmp_path, monkeypatch):
+        def forbidden(*args, **kwargs):
+            raise AssertionError(f"os.replace called: {args}")
+
+        monkeypatch.setattr(os, "replace", forbidden)
+
+        cache = TimeseriesCache(ParquetBackend(tmp_path / "cache"))
+        cache.write(frame([1, 2]), **SERIES)
+        cache.write(frame([3, 4]), **SERIES)
+        cache.delete(start=ts(1), end=ts(1), **SERIES)
+
+        assert cache.read(**SERIES).frame.height == 3
+
+    def test_a_write_never_calls_os_rename(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            os,
+            "rename",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("rename")),
+        )
+        cache = TimeseriesCache(ParquetBackend(tmp_path / "cache"))
+        cache.write(frame([1]), **SERIES)
+        assert cache.read(**SERIES).frame.height == 1
+
+    def test_a_second_write_touches_none_of_the_first_write_s_files(self, tmp_path):
+        """The reason a half-written file cannot corrupt anything: publishing
+        writes names that did not exist, so no reader is looking at them."""
+        cache = TimeseriesCache(ParquetBackend(tmp_path / "cache"))
+        cache.write(frame([1]), **SERIES)
+        directory = only_key(tmp_path / "cache")
+        before = {p.name: p.read_bytes() for p in directory.iterdir()}
+
+        cache.write(frame([2]), **SERIES)
+
+        after = {p.name for p in directory.iterdir()}
+        assert after - set(before), "the second write created new files"
+        for name, content in before.items():
+            if name in after:
+                assert (directory / name).read_bytes() == content, (
+                    f"{name} was modified in place"
+                )
+
+
+class TestGenerations:
+    def test_the_newest_generation_serves(self, tmp_path):
+        cache = TimeseriesCache(ParquetBackend(tmp_path / "cache"))
+        cache.write(frame([1]), **SERIES)
+        cache.write(frame([2]), **SERIES)
+
+        directory = only_key(tmp_path / "cache")
+        assert max(ParquetBackend._generations(directory)) == 2
+        assert cache.read(**SERIES).frame.height == 2
+
+    def test_an_unparseable_newest_generation_is_skipped(self, tmp_path):
+        """The property that replaces the atomic rename: an interrupted write
+        leaves a generation that cannot be believed, so it is not."""
+        cache = TimeseriesCache(ParquetBackend(tmp_path / "cache"))
+        cache.write(frame([1]), start=ts(1), end=ts(1), **SERIES)
+        cache.write(frame([2]), start=ts(2), end=ts(2), **SERIES)
+
+        directory = only_key(tmp_path / "cache")
+        newest = max(ParquetBackend._generations(directory))
+        ParquetBackend._manifest_path(directory, newest).write_text('{"digest": ')
+
+        reopened = TimeseriesCache(ParquetBackend(tmp_path / "cache"))
+        assert reopened.read(**SERIES).frame.height == 1, "fell back a generation"
+        # Bounded, because an unbounded read spans only the coverage hull and so
+        # can never report a gap. The point is that the lost window is *unknown*
+        # again rather than claimed-and-empty.
+        assert reopened.read(start=ts(1), end=ts(2), **SERIES).missing
+
+    def test_an_orphaned_data_file_is_invisible(self, tmp_path):
+        """Rows with no manifest claiming them are not part of the cache."""
+        cache = TimeseriesCache(ParquetBackend(tmp_path / "cache"))
+        cache.write(frame([1]), **SERIES)
+
+        directory = only_key(tmp_path / "cache")
+        orphan = ParquetBackend._data_path(directory, 99)
+        orphan.write_bytes(b"not even parquet")
+
+        assert cache.read(**SERIES).frame.height == 1
+
+    def test_a_superseded_generation_is_cleaned_up(self, tmp_path):
+        cache = TimeseriesCache(ParquetBackend(tmp_path / "cache"))
+        for day in range(1, 6):
+            cache.write(frame([day]), **SERIES)
+
+        directory = only_key(tmp_path / "cache")
+        assert len(ParquetBackend._generations(directory)) <= 2, (
+            "steady state is the live generation plus one kept for readers"
+        )
+
+    def test_cleanup_failing_does_not_fail_the_write(self, tmp_path, monkeypatch):
+        """The point of publishing by create: a share that refuses deletes —
+        locked file, or an ACL without delete rights — costs disk, not writes."""
+        cache = TimeseriesCache(ParquetBackend(tmp_path / "cache"))
+        for day in (1, 2):
+            cache.write(frame([day]), **SERIES)
+
+        real_unlink = Path.unlink
+
+        def refuse(self, *args, **kwargs):
+            raise PermissionError(5, "Access is denied")
+
+        monkeypatch.setattr(Path, "unlink", refuse)
+
+        cache.write(frame([3]), **SERIES)  # must not raise
+        monkeypatch.setattr(Path, "unlink", real_unlink)
+
+        assert cache.read(**SERIES).frame.height == 3
+
+    def test_a_generation_number_is_never_reused(self, tmp_path):
+        """Reusing one would overwrite the evidence of a failed write — and be
+        a replace, which is the thing this design does not do."""
+        cache = TimeseriesCache(ParquetBackend(tmp_path / "cache"))
+        cache.write(frame([1]), **SERIES)
+
+        directory = only_key(tmp_path / "cache")
+        # A wedged generation from the future, with a manifest that won't parse.
+        ParquetBackend._manifest_path(directory, 7).write_text("{ truncated")
+
+        cache.write(frame([2]), **SERIES)
+        assert ParquetBackend._manifest_path(directory, 7).read_text() == "{ truncated"
+        assert max(ParquetBackend._generations(directory)) > 7
+
+
+class TestReadingAnOlderLayout:
+    def test_a_pre_generational_cache_still_reads(self, tmp_path):
+        """Caches written before this layout must not become unreadable."""
+        cache = TimeseriesCache(ParquetBackend(tmp_path / "cache"))
+        cache.write(frame([1, 2]), start=ts(1), end=ts(2), **SERIES)
+
+        directory = only_key(tmp_path / "cache")
+        generation = max(ParquetBackend._generations(directory))
+        ParquetBackend._manifest_path(directory, generation).rename(
+            directory / "manifest.json"
+        )
+        ParquetBackend._data_path(directory, generation).rename(
+            directory / "data.parquet"
+        )
+
+        reopened = TimeseriesCache(ParquetBackend(tmp_path / "cache"))
+        assert reopened.read(**SERIES).frame.height == 2
+        assert reopened.read(start=ts(1), end=ts(2), **SERIES).is_complete
+
+    def test_it_migrates_on_the_next_write(self, tmp_path):
+        cache = TimeseriesCache(ParquetBackend(tmp_path / "cache"))
+        cache.write(frame([1]), **SERIES)
+        directory = only_key(tmp_path / "cache")
+        generation = max(ParquetBackend._generations(directory))
+        ParquetBackend._manifest_path(directory, generation).rename(
+            directory / "manifest.json"
+        )
+        ParquetBackend._data_path(directory, generation).rename(
+            directory / "data.parquet"
+        )
+
+        reopened = TimeseriesCache(ParquetBackend(tmp_path / "cache"))
+        reopened.write(frame([2]), **SERIES)
+        reopened.write(frame([3]), **SERIES)
+
+        assert reopened.read(**SERIES).frame.height == 3
+        assert not (directory / "manifest.json").exists(), "legacy pair cleaned up"
+
 
 class TestChoosingAStagingDirectory:
     def test_a_local_root_stages_nowhere(self, tmp_path):
-        """The default must not pessimise the common case: building beside the
-        target keeps the publish a same-volume rename with nothing to copy."""
+        """Writing in place is right for a local cache — there is nothing to
+        gain from a copy when the target name is already unique."""
         assert ParquetBackend(tmp_path).staging_dir is None
 
     def test_a_remote_looking_root_stages_under_the_system_temp_dir(
@@ -46,7 +226,6 @@ class TestChoosingAStagingDirectory:
             ParquetBackend, "_looks_remote", staticmethod(lambda _: True)
         )
         backend = ParquetBackend(tmp_path)
-
         assert backend.staging_dir == Path(tempfile.gettempdir()) / STAGING_SUBDIR
 
     def test_an_explicit_directory_wins_over_auto_detection(
@@ -58,17 +237,13 @@ class TestChoosingAStagingDirectory:
         chosen = tmp_path / "c_temp"
         assert ParquetBackend(tmp_path, staging_dir=chosen).staging_dir == chosen
 
-    def test_none_forces_building_beside_the_target(self, tmp_path, monkeypatch):
-        """An explicit opt-out, even on a share. Someone with a fast local
-        share and a slow C: drive is entitled to make that call."""
+    def test_none_forces_writing_in_place(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             ParquetBackend, "_looks_remote", staticmethod(lambda _: True)
         )
         assert ParquetBackend(tmp_path, staging_dir=None).staging_dir is None
 
     def test_detection_is_conservative_off_windows(self, tmp_path):
-        """UNC paths and mapped drives are Windows shapes. Everywhere else the
-        answer is "local", so behavior is exactly what it has always been."""
         if os.name != "nt":
             assert ParquetBackend._looks_remote(tmp_path) is False
             assert ParquetBackend._looks_remote(Path(r"\\server\share")) is False
@@ -78,260 +253,216 @@ class TestChoosingAStagingDirectory:
         assert ParquetBackend._looks_remote(Path(r"\\server\share\cache")) is True
 
 
-class TestTheFsyncThatCrossedTheWire:
-    """Bug 2: staging moved the build off the share but left one fsync on it."""
-
-    @staticmethod
-    def _cross_volume(monkeypatch) -> None:
-        """Make any cross-directory rename raise EXDEV, as a real
-        local-disk-to-share rename does."""
-        real_replace = os.replace
-
-        def replace(src, dst, *args, **kwargs):
-            if Path(src).parent != Path(dst).parent:
-                raise OSError(errno.EXDEV, "Invalid cross-device link")
-            return real_replace(src, dst, *args, **kwargs)
-
-        monkeypatch.setattr(os, "replace", replace)
-
-    def test_a_share_that_refuses_fsync_does_not_fail_the_write(
+class TestStaging:
+    def test_the_build_happens_locally_and_one_copy_crosses(
         self, tmp_path, monkeypatch
     ):
-        """The reported error. SMB and DFS both refuse fsync on some servers,
-        and the write has to survive it: the bytes came from a source already
-        flushed locally, and atomicity rests on the rename, not this call."""
-        self._cross_volume(monkeypatch)
+        import shutil
+
+        copies: list[tuple[Path, Path]] = []
+        real_copyfile = shutil.copyfile
+
+        def recording(src, dst, *args, **kwargs):
+            copies.append((Path(src), Path(dst)))
+            return real_copyfile(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(shutil, "copyfile", recording)
+
         staging = tmp_path / "local"
         share = tmp_path / "share"
-        share.mkdir()
-        target = share / "data.parquet"
+        cache = TimeseriesCache(ParquetBackend(share, staging_dir=staging))
+        cache.write(frame([1]), **SERIES)
 
-        real_flush = ParquetBackend._flush
+        assert copies, "staging should copy finished bytes to the target"
+        assert all(src.parent == staging for src, _ in copies)
+        assert all(share in dst.parents for _, dst in copies)
+        assert not list(staging.iterdir()), "staging is left clean"
 
-        def refuse_on_the_share(path: Path) -> None:
-            if Path(path).parent == share:
-                raise OSError(errno.EBADF, "Bad file descriptor")
-            real_flush(path)
-
-        monkeypatch.setattr(ParquetBackend, "_flush", staticmethod(refuse_on_the_share))
-
-        ParquetBackend._atomic_write(
-            target, lambda p: p.write_bytes(b"payload"), staging_dir=staging
+    def test_the_copy_lands_under_its_final_name(self, tmp_path):
+        """No temp file beside the target and no rename after it: the
+        generation number already makes the name unique and unwatched."""
+        staging = tmp_path / "local"
+        share = tmp_path / "share"
+        TimeseriesCache(ParquetBackend(share, staging_dir=staging)).write(
+            frame([1]), **SERIES
         )
 
-        assert target.read_bytes() == b"payload"
-        assert list(share.iterdir()) == [target], "no temp left on the share"
-        assert not list(staging.iterdir()), "no temp left in staging"
+        names = sorted(p.name for p in only_key(share).iterdir())
+        assert all(name.startswith((MANIFEST_PREFIX, DATA_PREFIX)) for name in names), (
+            names
+        )
+        assert not any(name.endswith(".tmp") for name in names)
 
-    def test_the_local_build_is_still_flushed(self, tmp_path, monkeypatch):
-        """Tolerating the remote fsync must not quietly drop the local one —
-        that is the flush the crash guarantee actually rests on."""
-        self._cross_volume(monkeypatch)
+    def test_the_staging_directory_is_created_if_missing(self, tmp_path):
+        staging = tmp_path / "does" / "not" / "exist"
+        TimeseriesCache(ParquetBackend(tmp_path / "share", staging_dir=staging)).write(
+            frame([1]), **SERIES
+        )
+        assert staging.is_dir()
+
+    def test_a_failed_build_leaves_the_published_state_intact(self, tmp_path):
         staging = tmp_path / "local"
         share = tmp_path / "share"
-        share.mkdir()
 
-        flushed: list[Path] = []
+        class BuildFails(ParquetBackend):
+            armed = False
+
+            def _create(self, target, produce):  # type: ignore[override]
+                if self.armed and target.name.startswith(DATA_PREFIX):
+
+                    def explode(_path):
+                        raise RuntimeError("boom")
+
+                    produce = explode
+                super()._create(target, produce)
+
+        backend = BuildFails(share, staging_dir=staging)
+        cache = TimeseriesCache(backend)
+        cache.write(frame([1]), **SERIES)
+
+        backend.armed = True
+        with pytest.raises(RuntimeError):
+            cache.write(frame([2]), **SERIES)
+
+        backend.armed = False
+        assert cache.read(**SERIES).frame.height == 1
+        assert not list(staging.iterdir()), "no half-built file left behind"
+
+
+class TestFsyncOnAShare:
+    """A network redirector may refuse fsync outright — SMB and DFS both do on
+    some servers. Where the flush happens decides whether that is fatal."""
+
+    def test_no_flush_on_the_share_is_ever_strict(self, tmp_path, monkeypatch):
+        """The wiring that makes a refusing share survivable.
+
+        Asserted on the *call*, not by faking the outcome: a fake that swallowed
+        the error itself would prove nothing, since swallowing is the behavior
+        under test. If any share-side flush were strict, this raises.
+        """
+        staging = tmp_path / "local"
+        share = tmp_path / "share"
         real_flush = ParquetBackend._flush
+        calls: list[tuple[Path, bool]] = []
 
-        def recording(path: Path) -> None:
-            flushed.append(Path(path))
-            real_flush(path)
+        def recording(path: Path, *, strict: bool) -> None:
+            calls.append((Path(path), strict))
+            if share in Path(path).parents and strict:
+                raise AssertionError(f"strict flush on the share: {path}")
+            real_flush(path, strict=strict)
 
         monkeypatch.setattr(ParquetBackend, "_flush", staticmethod(recording))
 
-        ParquetBackend._atomic_write(
-            share / "data.parquet", lambda p: p.write_bytes(b"x"), staging_dir=staging
+        cache = TimeseriesCache(ParquetBackend(share, staging_dir=staging))
+        cache.write(frame([1, 2]), **SERIES)
+        cache.write(frame([3]), **SERIES)
+
+        assert cache.read(**SERIES).frame.height == 3
+        assert any(share in path.parents for path, _ in calls), "share was flushed"
+        assert any(path.parent == staging and strict for path, strict in calls), (
+            "the local build must still be flushed strictly"
         )
 
-        assert any(p.parent == staging for p in flushed), (
-            "the file built on local disk must still be fsync'd"
-        )
-
-
-class TestCrossVolumeDetection:
-    """Windows spells "cannot cross volumes" differently, and the difference is
-    only reachable on a share with staging on — nowhere a POSIX runner goes.
-
-    The reported failure: ``WinError 17`` escaping ``_publish`` as a hard error
-    instead of triggering the copy-then-rename fallback it exists for, because
-    the guard tested ``errno == EXDEV`` and Windows had not set that errno.
-    """
-
-    @staticmethod
-    def _windows_error() -> OSError:
-        """What os.replace raises across volumes on Windows: winerror 17, and
-        an errno that is *not* EXDEV."""
-        error = OSError(errno.EINVAL, "cannot move the file to a different disk drive")
-        error.winerror = 17  # type: ignore[attr-defined]
-        return error
-
-    def test_the_posix_spelling_is_recognized(self):
-        assert ParquetBackend._is_cross_volume(
-            OSError(errno.EXDEV, "Invalid cross-device link")
-        )
-
-    def test_the_windows_spelling_is_recognized(self):
-        assert ParquetBackend._is_cross_volume(self._windows_error())
-
-    def test_an_unrelated_error_is_not(self):
-        """The guard must stay narrow: re-raising is right for everything else,
-        and swallowing a permission error into a copy would hide it."""
-        assert not ParquetBackend._is_cross_volume(
-            PermissionError(errno.EACCES, "Access is denied")
-        )
-        assert not ParquetBackend._is_cross_volume(OSError(errno.ENOENT, "missing"))
-
-    def test_a_windows_cross_volume_rename_falls_back_to_copy_and_rename(
-        self, tmp_path, monkeypatch
-    ):
-        """End to end: the write must land, not raise."""
-        real_replace = os.replace
-        windows_error = self._windows_error()
-
-        def replace(src, dst, *args, **kwargs):
-            if Path(src).parent != Path(dst).parent:
-                raise windows_error
-            return real_replace(src, dst, *args, **kwargs)
-
-        monkeypatch.setattr(os, "replace", replace)
-
+    def test_the_local_build_is_still_flushed(self, tmp_path, monkeypatch):
+        """Tolerating the remote flush must not quietly drop the local one —
+        that is the flush the crash guarantee rests on."""
         staging = tmp_path / "local"
-        share = tmp_path / "share"
-        share.mkdir()
-        target = share / "data.parquet"
+        flushed: list[Path] = []
+        real_flush = ParquetBackend._flush
 
-        ParquetBackend._atomic_write(
-            target, lambda p: p.write_bytes(b"payload"), staging_dir=staging
+        def recording(path: Path, *, strict: bool) -> None:
+            flushed.append(Path(path))
+            real_flush(path, strict=strict)
+
+        monkeypatch.setattr(ParquetBackend, "_flush", staticmethod(recording))
+
+        TimeseriesCache(ParquetBackend(tmp_path / "share", staging_dir=staging)).write(
+            frame([1]), **SERIES
         )
 
-        assert target.read_bytes() == b"payload"
-        assert list(share.iterdir()) == [target]
-        assert not list(staging.iterdir())
+        assert any(p.parent == staging for p in flushed)
 
-    def test_an_unrelated_rename_failure_still_propagates(self, tmp_path, monkeypatch):
-        """Widening the guard must not turn every rename failure into a copy."""
+    def test_a_strict_flush_failure_says_what_to_do(self, tmp_path, monkeypatch):
+        """Someone who forces staging off onto a share should get the fix, not
+        a bare EBADF — that errno cost three rounds of diagnosis."""
+        target = tmp_path / "file"
+        target.write_bytes(b"x")
 
-        def replace(src, dst, *args, **kwargs):
-            raise OSError(errno.ENOSPC, "No space left on device")
-
-        monkeypatch.setattr(os, "replace", replace)
-
-        with pytest.raises(OSError, match="No space left"):
-            ParquetBackend._atomic_write(
-                tmp_path / "data.parquet", lambda p: p.write_bytes(b"x")
-            )
-
-
-class TestTheBuildSideFsyncStaysStrict:
-    def test_a_build_directory_that_refuses_fsync_raises(self, tmp_path, monkeypatch):
-        """Unlike the publish-side flush. If this one fails the data genuinely
-        may not be on disk, and silently continuing would be the exact silent
-        hole invariant 5 exists to forbid."""
-
-        def refuse(path):
+        def refuse(*args, **kwargs):
             raise OSError(errno.EBADF, "Bad file descriptor")
 
-        monkeypatch.setattr(ParquetBackend, "_flush", staticmethod(refuse))
+        monkeypatch.setattr(os, "fsync", refuse)
 
-        with pytest.raises(OSError, match="could not flush"):
-            ParquetBackend._atomic_write(
-                tmp_path / "data.parquet", lambda p: p.write_bytes(b"x")
-            )
+        with pytest.raises(OSError, match="staging_dir") as caught:
+            ParquetBackend._flush(target, strict=True)
+        assert "fsync=False" in str(caught.value)
 
-    def test_the_error_says_what_to_do_about_it(self, tmp_path, monkeypatch):
-        """A bare EBADF sent the user round three rounds of diagnosis. The
-        message has to name the cause and the fix."""
+    def test_a_best_effort_flush_failure_is_swallowed(self, tmp_path, monkeypatch):
+        target = tmp_path / "file"
+        target.write_bytes(b"x")
 
-        def refuse(path):
+        def refuse(*args, **kwargs):
             raise OSError(errno.EBADF, "Bad file descriptor")
 
-        monkeypatch.setattr(ParquetBackend, "_flush", staticmethod(refuse))
+        monkeypatch.setattr(os, "fsync", refuse)
 
-        with pytest.raises(OSError) as caught:
-            ParquetBackend._atomic_write(
-                tmp_path / "data.parquet", lambda p: p.write_bytes(b"x")
-            )
-
-        message = str(caught.value)
-        assert "staging_dir" in message
-        assert "fsync=False" in message
-
-    def test_a_failed_flush_leaves_no_temp_behind(self, tmp_path, monkeypatch):
-        def refuse(path):
-            raise OSError(errno.EBADF, "Bad file descriptor")
-
-        monkeypatch.setattr(ParquetBackend, "_flush", staticmethod(refuse))
-
-        with pytest.raises(OSError):
-            ParquetBackend._atomic_write(
-                tmp_path / "data.parquet", lambda p: p.write_bytes(b"x")
-            )
-
-        assert list(tmp_path.iterdir()) == []
+        ParquetBackend._flush(target, strict=False)  # must not raise
 
 
 class TestTheWholeCacheOverASimulatedShare:
-    def test_a_round_trip_survives_a_share_that_refuses_fsync(
+    def test_a_round_trip_survives_every_hostile_thing_a_share_does(
         self, tmp_path, monkeypatch
     ):
-        """End to end, through the cache rather than the backend's internals:
-        write, merge, read, delete — with every network fsync refused."""
-        import polars as pl
-
-        from timeseries_cache import TimeseriesCache
-
-        from .conftest import frame
-
+        """Refuses fsync, refuses deletes, and would refuse any rename. The
+        cache has to work anyway."""
         share = tmp_path / "share"
-        share.mkdir()
-        real_replace = os.replace
-
-        def replace(src, dst, *args, **kwargs):
-            if Path(src).parent != Path(dst).parent:
-                raise OSError(errno.EXDEV, "Invalid cross-device link")
-            return real_replace(src, dst, *args, **kwargs)
-
+        staging = tmp_path / "local"
         real_flush = ParquetBackend._flush
 
-        def refuse_on_the_share(path: Path) -> None:
+        def refuse_flush(path: Path, *, strict: bool) -> None:
             if share in Path(path).parents:
-                raise OSError(errno.EBADF, "Bad file descriptor")
-            real_flush(path)
+                # What SMB/DFS do. Strict here would be a failed write, which is
+                # exactly what must not happen.
+                if strict:
+                    raise AssertionError(f"strict flush on the share: {path}")
+                return
+            real_flush(path, strict=strict)
 
-        monkeypatch.setattr(os, "replace", replace)
-        monkeypatch.setattr(ParquetBackend, "_flush", staticmethod(refuse_on_the_share))
+        def refuse_rename(*args, **kwargs):
+            raise AssertionError("the write path must not rename")
 
-        series = {"ticker": "AAPL"}
-        cache = TimeseriesCache(ParquetBackend(share, staging_dir=tmp_path / "local"))
-        cache.write(frame([1, 2]), **series)
-        cache.write(frame([3]), **series)
+        monkeypatch.setattr(ParquetBackend, "_flush", staticmethod(refuse_flush))
+        monkeypatch.setattr(os, "replace", refuse_rename)
 
-        assert cache.read(**series).frame.height == 3
-
-        cache.delete(**series)
-        assert cache.read(**series).frame.height == 0
-        assert isinstance(cache.read(**series).frame, pl.DataFrame)
-
-    def test_nothing_is_left_in_the_staging_directory(self, tmp_path, monkeypatch):
-        from timeseries_cache import TimeseriesCache
-
-        from .conftest import frame
-
-        real_replace = os.replace
-
-        def replace(src, dst, *args, **kwargs):
-            if Path(src).parent != Path(dst).parent:
-                raise OSError(errno.EXDEV, "Invalid cross-device link")
-            return real_replace(src, dst, *args, **kwargs)
-
-        monkeypatch.setattr(os, "replace", replace)
-
-        share = tmp_path / "share"
-        share.mkdir()
-        staging = tmp_path / "local"
         cache = TimeseriesCache(ParquetBackend(share, staging_dir=staging))
-        for day in range(1, 4):
-            cache.write(frame([day]), ticker="AAPL")
+        cache.write(frame([1, 2]), start=ts(1), end=ts(2), **SERIES)
+        cache.write(frame([3, 4]), start=ts(3), end=ts(4), **SERIES)
+        assert cache.read(**SERIES).frame.height == 4
 
+        cache.delete(start=ts(1), end=ts(1), **SERIES)
+        result = cache.read(start=ts(1), end=ts(4), **SERIES)
+        assert result.frame.height == 3
+        assert result.missing, "the deleted window is unknown again, not covered"
+
+        reopened = TimeseriesCache(ParquetBackend(share, staging_dir=staging))
+        assert reopened.read(**SERIES).frame.height == 3
         assert not list(staging.iterdir())
+
+    def test_a_share_with_no_delete_rights_at_all_still_works(
+        self, tmp_path, monkeypatch
+    ):
+        """The configuration no rename-based design can survive: create and
+        write permitted, delete refused."""
+        share = tmp_path / "share"
+        cache = TimeseriesCache(ParquetBackend(share, staging_dir=tmp_path / "local"))
+        cache.write(frame([1]), **SERIES)
+
+        def refuse(self, *args, **kwargs):
+            raise PermissionError(5, "Access is denied")
+
+        monkeypatch.setattr(Path, "unlink", refuse)
+
+        for day in (2, 3, 4):
+            cache.write(frame([day]), **SERIES)
+
+        assert cache.read(**SERIES).frame.height == 4

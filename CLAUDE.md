@@ -122,22 +122,37 @@ this note exists to prevent.
 
 ### 5. A write either lands completely or not at all
 
-Files are written to a temporary path and atomically renamed. The rule is that the
-**interruptible middle state must under-claim**, which means the order depends on
-direction:
+**Publishing is a create, never a rename or an overwrite.** Each write lays down a
+new numbered generation — `data-<n>.parquet` then `manifest-<n>.json` — and a
+reader uses the newest manifest that *parses*. Four separate production failures on
+a DFS share came from the older rename-based design, and they were all the same
+mistake: replacing a file requires the target to be unheld, deletable, and on the
+same volume, and a share may refuse any of the three. Creating a file requires none
+of them.
 
-- **Growing** (new rows, wider coverage) — data first, manifest last. A crash leaves
-  rows nothing claims: harmless, costs a refetch.
-- **Shrinking** (`delete`, which removes rows *and* their coverage) — manifest first,
-  data last. Data-first here would leave the manifest claiming a range whose rows are
-  gone, and a read would answer "covered, and genuinely empty" — the silent hole this
-  invariant exists to forbid. `StorageBackend.write` takes `manifest_first` for this.
+What that buys, and what a port must preserve:
 
-The atomic step is always a **same-volume rename**. A rename cannot cross volumes —
-`os.replace` fails rather than copying — so when a file is built elsewhere (`staging_dir`, for a
-network root) it is copied to a temp beside the target first and renamed from there.
-Never publish by copying straight onto the target: that is the one shape where a
-reader can observe a half-written file.
+- **A partial write is invisible, not corrupting.** Nothing consults `data-<n>`
+  until `manifest-<n>` parses, and a manifest interrupted mid-write cannot parse —
+  JSON needs its closing brace. So the generation is skipped and the previous one
+  still serves. **This validate-on-read step is what replaces the atomic rename;
+  don't remove it in favour of "the write is atomic anyway".**
+- **The ordering rule collapses to one case.** Data first, manifest last, always.
+  Growing and shrinking updates are identical because nothing existing is mutated,
+  so both under-claim on a crash. `manifest_first` survives on the protocol for
+  backends that *do* mutate in place, and the parquet backend ignores it.
+- **Cleanup may fail.** Superseded generations are deleted best-effort; a share that
+  refuses deletes costs disk, never a write. This is what makes the cache usable on
+  a share ACL'd "create and write, but not delete" — the one configuration no
+  rename-based design survives.
+- The cost is two live generations per key, since the previous one is kept until the
+  next write so a reader mid-scan can't be pulled out from under.
+
+`staging_dir` (default `"auto"`) builds on local disk when the root looks remote, so
+parquet encoding *and the fsync* stay off the wire; one streamed copy then lands
+directly under the final name. Copying straight onto a *live* target would be the
+one shape where a reader observes a half-written file — which is exactly why the
+target name carries a generation number nothing is looking at yet.
 
 Prefer over-fetching after a crash to serving a silent hole, always.
 
@@ -230,28 +245,25 @@ Documented in `python/README.md` and deliberate — don't "fix" them without ask
 - **Single-writer per key.** Writes are read-modify-write with no lock. Concurrent
   writers to the same key can lose an update. On a shared network drive that stops
   being hypothetical — say so rather than assuming a caller has read this far.
-- **Network/DFS shares are second-class.** The atomic rename needs the target to be
-  unheld and deletable, and a share gives you neither reliably. `staging_dir`
-  (default `"auto"` — local temp when the root looks remote, beside the target
-  otherwise) moves the build *and the fsync* onto local disk; `replace_attempts`
-  rides out transient holders (DFS Replication, indexers, antivirus); nothing
-  rescues a share ACL'd without delete rights, since a rename *is* a delete. Reads
-  are unimproved by any of it — a local `root` is still the better answer where
-  it's an option.
-- **"Cannot cross volumes" has two spellings and no shared `errno`.** POSIX
-  raises `EXDEV`; Windows raises `ERROR_NOT_SAME_DEVICE` (`WinError 17`) and does
-  not reliably translate it. `_is_cross_volume` checks both, and must keep doing
-  so — an `errno`-only test lets the exact case the copy-then-rename fallback
-  exists for escape as a hard error, on Windows, against a share, which is the
-  one configuration no test runner here can reach.
+- **Network/DFS shares are supported for writes, second-class for reads.** The
+  generational layout means a write needs only create permission, so a share without
+  delete rights works. `staging_dir` (default `"auto"`) keeps encoding and the fsync
+  off the wire; `create_attempts` rides out transient holders. Reads are unimproved
+  by any of it — a local `root` is still faster where it's an option.
+- **Don't reintroduce a rename.** It is the obvious way to publish and it was tried;
+  it produced four production failures in a row (fsync refused on the share, fsync on
+  a read-only descriptor, a held file on Windows, and `ERROR_NOT_SAME_DEVICE` once
+  staging moved the build to another volume). Every one was a way for a share to
+  refuse *replacement*. A create cannot hit any of them.
 - **`os.fsync` is not available on every filesystem.** A network redirector may
   refuse it outright (SMB/DFS return EBADF or EINVAL), so *where* a file is flushed
   decides whether a write can succeed at all. Two flushes, two rules, and they must
   not be conflated: the **build-side** flush is strict, because that is where
   durability is established, and its error names `staging_dir`/`fsync=False`; the
-  **publish-side** flush of the copy landed on the share is `suppress`ed, because
-  its source was already durable locally and atomicity rests on the rename. Any new
-  fsync call site has to answer which of the two it is.
+  **publish-side** flush of the copy landed on the share is `suppress`ed, because its
+  source was already durable locally and nothing reads the file until its manifest
+  exists. `_flush` takes `strict` for exactly this; any new call site has to answer
+  which of the two it is.
 - **Whole-key rewrite on write.** Reads scale (pushdown); writes scale with key size,
   not change size. The answer is more keys, not a rewrite of the storage model.
 - **A write never changes the stored schema.** Added or dropped columns are refused

@@ -104,12 +104,8 @@ refused — they have no reliable ordering across runs. `start`, `end`, `mode`,
 disk = TimeseriesCache(ParquetBackend(root / "cache"))
 disk.write(bars(3), ticker="AAPL", field="close")
 
-files = sorted(
-    p.relative_to(root / "cache").as_posix()
-    for p in (root / "cache").rglob("*")
-    if p.is_file()
-)
-assert [Path(f).name for f in files] == ["data.parquet", "manifest.json"]
+names = sorted(p.name for p in (root / "cache").rglob("*") if p.is_file())
+assert names == ["data-00000001.parquet", "manifest-00000001.json"]
 
 manifest = disk.manifest(ticker="AAPL", field="close")
 assert manifest is not None
@@ -120,6 +116,20 @@ Layout is `<root>/<shard>/<digest>/`, sharded by the digest's first byte so a
 cache with many keys doesn't build one enormous directory. The kwargs are stored
 verbatim next to the hash, so a digest collision surfaces as an error rather
 than one series quietly serving another's rows.
+
+**Files are numbered, and nothing is ever renamed or overwritten.** Each write
+creates the next generation and the newest manifest that parses is the one a
+reader uses:
+
+```python
+disk.write(bars(4), ticker="AAPL", field="close")
+
+generations = sorted(p.name for p in (root / "cache").rglob("manifest-*.json"))
+assert generations[-1] == "manifest-00000002.json"
+assert disk.read(ticker="AAPL", field="close").frame.height == 4
+```
+
+Why that matters is in the next section.
 
 ## Tuning
 
@@ -156,10 +166,23 @@ climbing and wide reads get worse.
 
 ## Caching onto a network or DFS share
 
-If `root` is a UNC path or mapped drive this happens **automatically** — the
-backend detects a remote root and builds under the system temp dir, so parquet
-encoding and the fsync stay off the wire. The explicit form, for choosing the
-directory yourself or for simulating the shape in a test:
+**A write never renames or replaces a file**, and that is what makes a share
+workable. Publishing by rename — the textbook way to make a write atomic — needs
+the target to be unheld by every other process, deletable (replacing a file *is*
+deleting one), and on the same volume as the temp. A share is entitled to refuse
+all three, and refusing any one of them fails the write.
+
+Creating a file needs none of that. So a write puts down `data-<n>.parquet` and
+then `manifest-<n>.json`, both under names nothing is looking at yet, and the
+generation becomes real the moment the manifest lands. An interrupted write
+leaves a manifest that doesn't parse, which readers skip — so a partial write is
+invisible rather than corrupting. Cleanup of old generations is best-effort: a
+share that refuses deletes costs disk space, never a failed write.
+
+If `root` is a UNC path or mapped drive, the build also happens locally
+**automatically** — the backend detects a remote root and builds under the
+system temp dir, so parquet encoding and the fsync stay off the wire. The
+explicit form, for choosing the directory yourself:
 
 ```python
 networked = TimeseriesCache(
@@ -175,12 +198,10 @@ assert networked.read(ticker="AAPL").frame.height == 100
 assert not list((root / "local_staging").iterdir())  # staging is left clean
 ```
 
-Parquet encoding and the fsync happen on local disk. Publishing then copies the
-finished file to a temp *beside* the target and renames it there — two steps,
-because **a rename cannot cross volumes** — `os.replace` fails rather than
-silently copying, as `EXDEV` on POSIX and `WinError 17` on Windows, which do
-*not* share an `errno`. The rename within the share is still atomic, so a reader
-never sees a partial file.
+Parquet encoding and the fsync happen on local disk; one streamed copy of the
+finished file crosses the wire, landing directly under its final name. No temp
+beside the target, no rename — the generation number already makes the name
+unique and unwatched.
 
 The fsync is the part that matters most. A network redirector may refuse
 `os.fsync` outright — SMB and DFS both do on some servers, which surfaces as
@@ -189,9 +210,9 @@ that call onto a filesystem that answers it, and the one flush that still
 happens on the share (of the copy about to be renamed) is best-effort for
 exactly that reason.
 
-Two things staging does *not* fix: reads still go to the share, and on Windows
-the final rename can be refused while anything holds the target open — DFS
-Replication, an indexer, antivirus. `replace_attempts` retries through that.
+One thing staging does *not* fix: reads still go to the share, and the
+row-group skipping the cache is tuned around gives back much less over a
+network. A local `root` is faster in both directions where that's an option.
 
 ## The stored schema wins
 
@@ -310,14 +331,12 @@ it once. Through the pandas facade `recast` takes pandas dtypes
 Data and manifest are written to temp files and atomically renamed, ordered so
 an interrupted write always **under-claims**:
 
-| direction | order | what a crash leaves |
-|---|---|---|
-| growing (new rows, wider coverage) | data first, manifest last | rows nothing claims — harmless, costs a refetch |
-| shrinking (`delete`) | manifest first, data last | coverage dropped early — the range is refetched |
-
-The reverse of that second case would leave the manifest claiming a range whose
-rows are gone, and a read would answer *"covered, and genuinely empty"* — a
-silent hole.
+Data is written first and the manifest last, always. There is no second case:
+because a generation is published rather than mutated in place, a crash at any
+point leaves the previous generation intact and the new one unreferenced. Both
+growing and shrinking updates therefore under-claim, and a read of the lost
+window answers *"unknown"* rather than *"covered, and genuinely empty"* — the
+silent hole invariant 5 exists to forbid.
 
 `fsync=False` is faster but gives that up: after a power loss the manifest may
 be durable while its rows are not. Reasonable only if the cache is genuinely

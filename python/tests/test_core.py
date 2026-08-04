@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
@@ -571,15 +570,24 @@ class TestCollisionDetection:
             manifest.verify(impostor)
 
 
-class TestAtomicity:
+class TestDurability:
+    """Publishing is a create, so there is no rename and nothing to replace.
+
+    The old class here tested an in-place update: build a temp, fsync it, rename
+    it over the live file, retry when Windows refused. Every one of those steps
+    was a way for a network share to fail a write, so the layout changed and the
+    tests changed with it. What has to stay true is the *guarantee*, not the
+    mechanism: an interrupted write leaves the cache under-claiming.
+    """
+
     def test_a_failed_write_leaves_prior_state_intact(self):
         class ExplodingBackend(MemoryBackend):
             armed = False
 
-            def write(self, key, frame, manifest):
+            def write(self, key, frame, manifest, *, manifest_first=False):
                 if self.armed:
                     raise OSError("disk full")
-                super().write(key, frame, manifest)
+                super().write(key, frame, manifest, manifest_first=manifest_first)
 
         backend = ExplodingBackend()
         cache = TimeseriesCache(backend)
@@ -593,21 +601,21 @@ class TestAtomicity:
         assert days(result) == [ts(1), ts(2)]
         assert result.missing  # the failed range is still unknown, not claimed
 
-    def test_manifest_lands_after_data(self, tmp_path):
-        """If the manifest write fails, the cache must under-claim, not over-claim.
+    def test_an_unpublished_generation_is_invisible(self, tmp_path):
+        """If the manifest never lands, its data file is not part of the cache.
 
-        Rows may already be on disk; coverage must not mention them, so the next
-        read refetches rather than serving a range nothing verified.
+        Rows may be on disk; coverage must not mention them, so the next read
+        refetches rather than serving a range nothing verified.
         """
-        from timeseries_cache.backends.parquet import MANIFEST_NAME, ParquetBackend
+        from timeseries_cache.backends.parquet import MANIFEST_PREFIX, ParquetBackend
 
         class ManifestFailsBackend(ParquetBackend):
             armed = False
 
-            def _atomic_write(self, target, produce, **kwargs):  # type: ignore[override]
-                if self.armed and target.name == MANIFEST_NAME:
+            def _create(self, target, produce):  # type: ignore[override]
+                if self.armed and target.name.startswith(MANIFEST_PREFIX):
                     raise OSError("disk full")
-                ParquetBackend._atomic_write(target, produce, **kwargs)
+                super()._create(target, produce)
 
         backend = ManifestFailsBackend(tmp_path / "cache")
         cache = TimeseriesCache(backend)
@@ -618,27 +626,46 @@ class TestAtomicity:
             cache.write(frame([5, 6]), **SERIES)
 
         backend.armed = False
-        coverage = cache.coverage(**SERIES)
-        assert coverage.intervals == (Interval(ts(1), ts(2)),)
+        assert cache.coverage(**SERIES).intervals == (Interval(ts(1), ts(2)),)
         assert cache.read(start=ts(1), end=ts(6), **SERIES).missing
+        assert prices(cache.read(**SERIES)) == [101.0, 102.0]
+
+    def test_a_truncated_manifest_is_skipped_not_believed(self, tmp_path):
+        """The property that replaces the atomic rename.
+
+        A manifest interrupted mid-write cannot parse — JSON needs its closing
+        brace — so the generation is skipped and the previous one still serves.
+        Believing it would be the silent hole invariant 5 forbids.
+        """
+        from timeseries_cache.backends.parquet import ParquetBackend
+
+        backend = ParquetBackend(tmp_path / "cache")
+        cache = TimeseriesCache(backend)
+        cache.write(frame([1, 2]), start=ts(1), end=ts(2), **SERIES)
+        cache.write(frame([3, 4]), start=ts(3), end=ts(4), **SERIES)
+
+        directory = next((tmp_path / "cache").glob("*/*"))
+        newest = max(ParquetBackend._generations(directory))
+        manifest_path = ParquetBackend._manifest_path(directory, newest)
+        whole = manifest_path.read_text()
+        manifest_path.write_text(whole[: len(whole) // 2])
+
+        result = TimeseriesCache(ParquetBackend(tmp_path / "cache")).read(**SERIES)
+        assert prices(result) == [101.0, 102.0], "fell back to the previous generation"
 
     def test_interrupted_delete_never_leaves_a_silent_hole(self, tmp_path):
-        """A delete *shrinks* what the manifest claims, so the usual data-first
-        order is the wrong way round.
-
-        Data-first, interrupted, would leave coverage claiming a range whose rows
-        are gone — and a read of it would answer "covered, and genuinely empty",
-        which is exactly the lie invariant 5 exists to prevent.
-        """
-        from timeseries_cache.backends.parquet import DATA_NAME, ParquetBackend
+        """A delete shrinks what the manifest claims. Under the old layout that
+        needed a reversed write order; publishing a whole generation makes the
+        question moot, and this proves the guarantee still holds."""
+        from timeseries_cache.backends.parquet import DATA_PREFIX, ParquetBackend
 
         class DataWriteFailsBackend(ParquetBackend):
             armed = False
 
-            def _atomic_write(self, target, produce, **kwargs):  # type: ignore[override]
-                if self.armed and target.name == DATA_NAME:
+            def _create(self, target, produce):  # type: ignore[override]
+                if self.armed and target.name.startswith(DATA_PREFIX):
                     raise OSError("disk full")
-                ParquetBackend._atomic_write(target, produce, **kwargs)
+                super()._create(target, produce)
 
         backend = DataWriteFailsBackend(tmp_path / "cache")
         cache = TimeseriesCache(backend)
@@ -650,19 +677,15 @@ class TestAtomicity:
 
         backend.armed = False
         result = cache.read(start=ts(1), end=ts(5), **SERIES)
-        # The rows may or may not be gone, but the range must NOT read as
-        # "covered and empty" — it has to come back as unknown so it refetches.
-        assert result.missing.intervals == (Interval(ts(2), ts(3)),)
-        assert not result.is_complete
+        assert result.is_complete, "the delete did not happen, so nothing is unknown"
+        assert prices(result) == [101.0, 102.0, 103.0, 104.0, 105.0]
 
     def test_fsync_receives_a_writable_descriptor(self, tmp_path, monkeypatch):
         """Portability guard, not a behavior check.
 
         POSIX permits fsync on a read-only descriptor, so a read-only open here
-        passes on Linux and macOS and then fails on Windows, where os.fsync is
-        _commit() and rejects a read-only CRT handle with EBADF — surfacing as
-        "Bad file descriptor". Nothing on this platform reproduces that, so the
-        invariant is asserted directly instead.
+        passes on Linux and then fails on Windows, where os.fsync is _commit()
+        and rejects a read-only CRT handle with EBADF.
         """
         fcntl = pytest.importorskip(
             "fcntl", reason="access-mode introspection is POSIX-only"
@@ -675,327 +698,105 @@ class TestAtomicity:
         real_fsync = os.fsync
 
         def recording_fsync(fd: int) -> None:
-            # Only the *file* descriptor is in scope. The directory fsync is
-            # necessarily read-only — a directory cannot be opened for writing —
-            # which is exactly why `_fsync_dir` treats it as best-effort.
             if stat.S_ISREG(os.fstat(fd).st_mode):
                 modes.append(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE)
             real_fsync(fd)
 
         monkeypatch.setattr(os, "fsync", recording_fsync)
 
-        target = tmp_path / "data.parquet"
-        ParquetBackend._atomic_write(target, lambda p: p.write_bytes(b"payload"))
+        TimeseriesCache(ParquetBackend(tmp_path / "cache")).write(frame([1]), **SERIES)
 
-        assert modes, "fsync was never called on the file"
+        assert modes, "fsync was never called on a file"
         assert all(mode in (os.O_WRONLY, os.O_RDWR) for mode in modes), (
             f"fsync got a read-only descriptor (access modes {modes}); "
             "this raises EBADF on Windows"
         )
-        assert target.read_bytes() == b"payload"
 
     def test_the_scan_is_released_before_the_backend_writes(self, tmp_path):
-        """Windows cannot replace a file while a handle to it is open.
-
-        `write()` scans the key's existing parquet to merge against, then hands
-        the result to the backend, which moves a new file onto that same path.
-        If the scan is still alive at that moment, the replace fails with
-        PermissionError on Windows. POSIX allows it — the old inode survives its
-        last handle — which is exactly why this needs asserting rather than
-        observing: nothing here would ever fail on the machine CI runs on.
-
-        Checked with a weak reference, so it holds on any platform.
+        """Less critical than it was — a write no longer touches the file it
+        scanned — but cleanup still deletes superseded generations, and Windows
+        will not unlink a file anything holds open.
         """
-        import gc
         import weakref
 
         from timeseries_cache.backends.parquet import ParquetBackend
 
-        scanned: list[weakref.ref] = []
-        alive_at_write: list[bool] = []
+        handed_out: list[weakref.ref] = []
 
-        class WatchfulBackend(ParquetBackend):
-            def scan(self, key):  # type: ignore[no-untyped-def]
+        class TrackingBackend(ParquetBackend):
+            def scan(self, key):  # type: ignore[override]
                 lazy = super().scan(key)
                 if lazy is not None:
-                    scanned.append(weakref.ref(lazy))
+                    handed_out.append(weakref.ref(lazy))
                 return lazy
 
-            def write(self, key, frame, manifest, *, manifest_first=False):  # type: ignore[no-untyped-def]
-                gc.collect()
-                alive_at_write.append(any(ref() is not None for ref in scanned))
-                super().write(key, frame, manifest, manifest_first=manifest_first)
+        cache = TimeseriesCache(TrackingBackend(tmp_path / "cache"))
+        cache.write(frame([1, 2]), **SERIES)
+        cache.write(frame([3, 4]), **SERIES)
 
-        cache = TimeseriesCache(WatchfulBackend(tmp_path / "cache"))
-        cache.write(frame([1, 2]), **SERIES)  # first write: nothing to scan
-        cache.write(frame([3, 4]), **SERIES)  # second: merges against the file
-
-        assert scanned, "the second write should have scanned the existing file"
-        assert not any(alive_at_write), (
-            "a LazyFrame over the target file was still alive when the backend "
-            "replaced it; this raises PermissionError on Windows"
+        assert handed_out, "the second write should have scanned the first"
+        assert all(ref() is None for ref in handed_out), (
+            "a LazyFrame outlived the write; on Windows that blocks cleanup"
         )
-        assert days(cache.read(**SERIES)) == [ts(1), ts(2), ts(3), ts(4)]
 
-    @pytest.mark.parametrize("failing", ["open", "fsync", "close"])
-    def test_directory_fsync_never_breaks_a_write(
-        self, tmp_path, monkeypatch, failing: str
-    ):
-        """The directory fsync is a durability refinement, not a requirement.
-
-        Platforms disagree at every step — Windows can't open a directory as a
-        file, macOS and some network filesystems refuse to fsync one, and either
-        can leave a descriptor whose close then fails. Any of those raising
-        would turn a harmless quirk into a failed write, so all three are
-        guarded and this pins that down.
-        """
-        import stat
-        from pathlib import Path
-
-        from timeseries_cache.backends.parquet import ParquetBackend
-
-        real_open, real_fsync, real_close = os.open, os.fsync, os.close
-        ebadf = OSError(9, "Bad file descriptor")
-
-        def is_directory_fd(fd: int) -> bool:
-            return stat.S_ISDIR(os.fstat(fd).st_mode)
-
-        if failing == "open":
-
-            def fake_open(path, *args, **kwargs):  # type: ignore[no-untyped-def]
-                if Path(path).is_dir():
-                    raise ebadf
-                return real_open(path, *args, **kwargs)
-
-            monkeypatch.setattr(os, "open", fake_open)
-
-        elif failing == "fsync":
-
-            def fake_fsync(fd: int) -> None:
-                if is_directory_fd(fd):
-                    raise ebadf
-                real_fsync(fd)
-
-            monkeypatch.setattr(os, "fsync", fake_fsync)
-
-        else:
-
-            def fake_close(fd: int) -> None:
-                directory = is_directory_fd(fd)
-                real_close(fd)  # still release it, then report failure
-                if directory:
-                    raise ebadf
-
-            monkeypatch.setattr(os, "close", fake_close)
-
-        target = tmp_path / "data.parquet"
-        ParquetBackend._atomic_write(target, lambda p: p.write_bytes(b"payload"))
-
-        assert target.read_bytes() == b"payload"
-        assert list(tmp_path.iterdir()) == [target], "a temp file was left behind"
-
-    def test_replace_retries_through_a_transient_lock(self, tmp_path, monkeypatch):
-        """The DFS / network-share case.
-
-        On Windows a file cannot be replaced while anything holds it open, and
-        on a network share the holder is often a service you don't control —
-        DFS Replication, the server's indexer, antivirus — that lets go a moment
-        later. A bounded retry turns that from a failed write into a pause.
-        """
-        from timeseries_cache.backends.parquet import ParquetBackend
-
-        real_replace = os.replace
-        calls = {"n": 0}
-
-        def flaky_replace(src, dst, *args, **kwargs):
-            calls["n"] += 1
-            if calls["n"] < 3:  # held for the first two attempts, then released
-                raise PermissionError(32, "The process cannot access the file")
-            return real_replace(src, dst, *args, **kwargs)
-
-        monkeypatch.setattr(os, "replace", flaky_replace)
-        monkeypatch.setattr("time.sleep", lambda _seconds: None)  # no real waiting
-
-        target = tmp_path / "data.parquet"
-        ParquetBackend._atomic_write(target, lambda p: p.write_bytes(b"payload"))
-
-        assert calls["n"] == 3, "should have retried until the lock cleared"
-        assert target.read_bytes() == b"payload"
-        assert list(tmp_path.iterdir()) == [target], "a temp file was left behind"
-
-    def test_replace_gives_up_and_says_what_it_tried(self, tmp_path, monkeypatch):
-        """A permanent holder must still fail — quickly, and informatively.
-
-        Which it was matters: exhausting every attempt points at a permission
-        problem or a permanent holder, not a transient one, and the message has
-        to carry enough to tell them apart.
-        """
-        from timeseries_cache.backends.parquet import ParquetBackend
-
-        def always_denied(src, dst, *args, **kwargs):
-            raise PermissionError(5, "Access is denied")
-
-        monkeypatch.setattr(os, "replace", always_denied)
-        monkeypatch.setattr("time.sleep", lambda _seconds: None)
-
-        target = tmp_path / "data.parquet"
-        with pytest.raises(PermissionError) as caught:
-            ParquetBackend._atomic_write(
-                target, lambda p: p.write_bytes(b"payload"), attempts=3
-            )
-
-        message = str(caught.value)
-        assert "3 attempt(s)" in message
-        assert "delete rights" in message, "should name the permission cause"
-        assert "Access is denied" in message, "should keep the underlying error"
-        assert caught.value.__cause__ is not None, "original error must be chained"
-        assert not list(tmp_path.iterdir()), "the temp file must still be cleaned up"
-
-    def test_a_single_attempt_does_not_retry(self, tmp_path, monkeypatch):
-        from timeseries_cache.backends.parquet import ParquetBackend
-
-        calls = {"n": 0}
-
-        def always_denied(src, dst, *args, **kwargs):
-            calls["n"] += 1
-            raise PermissionError(5, "Access is denied")
-
-        monkeypatch.setattr(os, "replace", always_denied)
-        target = tmp_path / "data.parquet"
-        with pytest.raises(PermissionError):
-            ParquetBackend._atomic_write(
-                target, lambda p: p.write_bytes(b"x"), attempts=1
-            )
-        assert calls["n"] == 1
-
-    def test_replace_attempts_must_be_positive(self, tmp_path):
+    def test_create_attempts_must_be_positive(self, tmp_path):
         from timeseries_cache.backends.parquet import ParquetBackend
 
         with pytest.raises(ValueError, match="at least 1"):
-            ParquetBackend(tmp_path, replace_attempts=0)
+            ParquetBackend(tmp_path, create_attempts=0)
 
-    def test_staging_builds_locally_and_publishes_across_volumes(
+    def test_a_create_retries_through_a_transient_lock(self, tmp_path, monkeypatch):
+        """A scanner holding a brand-new file open is momentary; failing the
+        write over it is not worth doing."""
+        from timeseries_cache.backends.parquet import ParquetBackend
+
+        backend = ParquetBackend(tmp_path / "cache", create_backoff=0.001)
+        calls = {"n": 0}
+        real_flush = ParquetBackend._flush
+
+        def flaky(path, *, strict):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise PermissionError(5, "Access is denied")
+            real_flush(path, strict=strict)
+
+        monkeypatch.setattr(ParquetBackend, "_flush", staticmethod(flaky))
+
+        TimeseriesCache(backend).write(frame([1]), **SERIES)
+        assert calls["n"] > 1, "the first attempt should have been retried"
+
+    def test_a_permanent_denial_says_creates_need_no_delete_rights(
         self, tmp_path, monkeypatch
     ):
-        """The network-share shape: build on local disk, publish to the share.
-
-        A rename cannot cross volumes, so publishing streams the finished file
-        to a temp *beside* the target and renames it there. Simulated by making
-        any cross-directory replace raise EXDEV, which is what a real
-        local-disk-to-share rename does.
-        """
-        import errno
-        from pathlib import Path as P
-
+        """The message has to distinguish itself from the old rename failure:
+        a create needs write permission, never delete."""
         from timeseries_cache.backends.parquet import ParquetBackend
 
-        real_replace = os.replace
-        copies: list[tuple[str, str]] = []
+        def always_denied(path, *, strict):
+            raise PermissionError(5, "Access is denied")
 
-        def cross_volume_replace(src, dst, *args, **kwargs):
-            if P(src).parent != P(dst).parent:
-                raise OSError(errno.EXDEV, "Invalid cross-device link")
-            return real_replace(src, dst, *args, **kwargs)
+        monkeypatch.setattr(ParquetBackend, "_flush", staticmethod(always_denied))
 
-        real_copyfile = shutil.copyfile
-
-        def recording_copyfile(src, dst, *args, **kwargs):
-            copies.append((str(src), str(dst)))
-            return real_copyfile(src, dst, *args, **kwargs)
-
-        monkeypatch.setattr(os, "replace", cross_volume_replace)
-        monkeypatch.setattr(shutil, "copyfile", recording_copyfile)
-
-        staging = tmp_path / "local_staging"
-        share = tmp_path / "share"
-        share.mkdir()
-        target = share / "data.parquet"
-
-        ParquetBackend._atomic_write(
-            target, lambda p: p.write_bytes(b"payload"), staging_dir=staging
+        backend = ParquetBackend(
+            tmp_path / "cache", create_attempts=2, create_backoff=0
         )
+        with pytest.raises(PermissionError, match="no delete rights"):
+            TimeseriesCache(backend).write(frame([1]), **SERIES)
 
-        assert target.read_bytes() == b"payload"
-        assert len(copies) == 1, "exactly one streamed copy should cross the volume"
-        assert P(copies[0][0]).parent == staging, "built in the staging directory"
-        assert P(copies[0][1]).parent == share, "landed beside the target"
-        assert list(share.iterdir()) == [target], "no temp left on the share"
-        assert not list(staging.iterdir()), "no temp left in staging"
-
-    def test_same_volume_staging_skips_the_copy(self, tmp_path, monkeypatch):
-        """Nothing should cross the wire when it doesn't have to."""
+    def test_a_failed_create_leaves_no_partial_file(self, tmp_path):
         from timeseries_cache.backends.parquet import ParquetBackend
 
-        copies: list[str] = []
-        monkeypatch.setattr(
-            shutil, "copyfile", lambda *a, **k: copies.append(str(a[0]))
-        )
-
-        target = tmp_path / "data.parquet"
-        ParquetBackend._atomic_write(
-            target, lambda p: p.write_bytes(b"payload"), staging_dir=tmp_path
-        )
-
-        assert target.read_bytes() == b"payload"
-        assert not copies, "a same-volume publish is a rename, not a copy"
-
-    def test_staging_directory_is_created_if_missing(self, tmp_path):
-        from timeseries_cache.backends.parquet import ParquetBackend
-
-        staging = tmp_path / "does" / "not" / "exist"
-        target = tmp_path / "data.parquet"
-        ParquetBackend._atomic_write(
-            target, lambda p: p.write_bytes(b"x"), staging_dir=staging
-        )
-        assert staging.is_dir()
-        assert target.read_bytes() == b"x"
-
-    def test_a_failed_build_leaves_the_target_untouched(self, tmp_path):
-        """Staging must not weaken the guarantee: a failure mid-build cannot
-        disturb what is already published."""
-        from timeseries_cache.backends.parquet import ParquetBackend
-
-        staging = tmp_path / "staging"
-        target = tmp_path / "share" / "data.parquet"
-        target.parent.mkdir()
-        target.write_bytes(b"original")
-
-        def explode(_path):
-            raise RuntimeError("encoding failed")
-
-        with pytest.raises(RuntimeError):
-            ParquetBackend._atomic_write(target, explode, staging_dir=staging)
-
-        assert target.read_bytes() == b"original"
-        assert not list(staging.iterdir()), "staging temp should be cleaned up"
-        assert list(target.parent.iterdir()) == [target]
-
-    def test_the_cache_round_trips_through_a_staging_directory(self, tmp_path):
-        from timeseries_cache.backends.parquet import ParquetBackend
-
-        staging = tmp_path / "staging"
-        cache = TimeseriesCache(ParquetBackend(tmp_path / "share", staging_dir=staging))
-        cache.write(frame([1, 2]), **SERIES)
-        cache.write(frame([3, 4]), **SERIES)  # exercises the merge path too
-        cache.delete(start=ts(1), end=ts(1), **SERIES)
-
-        assert days(cache.read(**SERIES)) == [ts(2), ts(3), ts(4)]
-        assert not list(staging.iterdir()), "staging should be left clean"
-
-    def test_atomic_write_cleans_up_after_a_failure(self, tmp_path):
-        from timeseries_cache.backends.parquet import ParquetBackend
-
-        target = tmp_path / "data.parquet"
-        target.write_text("original")
+        backend = ParquetBackend(tmp_path)
+        target = tmp_path / "data-00000001.parquet"
 
         def explode(_path):
             raise RuntimeError("boom")
 
         with pytest.raises(RuntimeError):
-            ParquetBackend._atomic_write(target, explode)
+            backend._create(target, explode)
 
-        assert target.read_text() == "original"
-        assert list(tmp_path.iterdir()) == [target]
+        assert not target.exists()
+        assert list(tmp_path.iterdir()) == []
 
 
 class TestPersistence:
