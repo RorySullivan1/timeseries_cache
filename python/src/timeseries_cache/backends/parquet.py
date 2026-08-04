@@ -179,8 +179,13 @@ class ParquetBackend:
         try:  # pragma: no cover - Windows-only
             import ctypes
 
-            get_drive_type = ctypes.windll.kernel32.GetDriveTypeW  # type: ignore[attr-defined]
-            return bool(get_drive_type(f"{drive}\\") == DRIVE_REMOTE)
+            # getattr, not `ctypes.windll`, and not a `type: ignore` either:
+            # `windll` is absent from the stubs off Windows and present on it,
+            # so a literal attribute access needs an ignore that mypy then
+            # flags as *unused* on the one platform this code runs. getattr is
+            # the spelling that type-checks the same way on both.
+            windll = getattr(ctypes, "windll")  # noqa: B009
+            return bool(windll.kernel32.GetDriveTypeW(f"{drive}\\") == DRIVE_REMOTE)
         except Exception:  # pragma: no cover - defensive
             return False
 
