@@ -53,6 +53,16 @@ DRIVE_REMOTE: Final[int] = 4
 rather than pulled from pywin32, which the core deliberately does not depend on.
 """
 
+ERROR_NOT_SAME_DEVICE: Final[int] = 17
+"""Windows' cross-volume rename refusal — "cannot move the file to a different
+disk drive".
+
+It has to be checked *by winerror*, not by ``errno``. Python does not
+necessarily translate it to ``EXDEV``, so an ``errno``-only test silently misses
+the exact case the fallback exists for — and it misses it only on Windows,
+against a share, which is precisely where it cannot be caught locally.
+"""
+
 DEFAULT_REPLACE_ATTEMPTS: Final[int] = 5
 DEFAULT_REPLACE_BACKOFF: Final[float] = 0.1
 """Retry budget for the final rename.
@@ -340,6 +350,27 @@ class ParquetBackend:
             raise
 
     @staticmethod
+    def _is_cross_volume(error: OSError) -> bool:
+        """Whether a failed rename failed *because* it would cross volumes.
+
+        Two spellings of one condition, and both are needed. POSIX raises
+        ``EXDEV``. Windows raises ``ERROR_NOT_SAME_DEVICE`` — "cannot move the
+        file to a different disk drive" — and does not reliably translate it
+        into ``EXDEV``, so an errno-only test lets the very case this fallback
+        exists for escape as a hard error.
+
+        That combination is unreachable from a POSIX test runner and only
+        reachable on Windows with a build directory on another volume, i.e. a
+        network share with staging on: the exact configuration that cannot be
+        exercised anywhere but a real deployment. So it is checked defensively
+        rather than by whichever spelling one platform happened to produce.
+        """
+        return (
+            error.errno == errno.EXDEV
+            or getattr(error, "winerror", None) == ERROR_NOT_SAME_DEVICE
+        )
+
+    @staticmethod
     def _publish(
         built: Path,
         target: Path,
@@ -350,12 +381,12 @@ class ParquetBackend:
     ) -> None:
         """Move a finished file onto ``target``, atomically.
 
-        A rename is atomic but cannot cross volumes — ``os.replace`` raises
-        ``EXDEV`` rather than silently copying — so when the file was built on
-        local disk and the cache lives on a network share, publishing takes two
-        steps: stream it to a temp file *beside* the target, then rename within
-        that volume. Readers still only ever see the whole old file or the whole
-        new one; the copy lands under a name nothing looks for.
+        A rename is atomic but cannot cross volumes — it fails rather than
+        silently copying — so when the file was built on local disk and the
+        cache lives on a network share, publishing takes two steps: stream it to
+        a temp file *beside* the target, then rename within that volume. Readers
+        still only ever see the whole old file or the whole new one; the copy
+        lands under a name nothing looks for.
 
         Same-volume builds skip the copy entirely and rename directly.
         """
@@ -363,7 +394,7 @@ class ParquetBackend:
             ParquetBackend._replace(built, target, attempts=attempts, backoff=backoff)
             return
         except OSError as error:
-            if error.errno != errno.EXDEV:
+            if not ParquetBackend._is_cross_volume(error):
                 raise
 
         descriptor, name = tempfile.mkstemp(

@@ -307,7 +307,7 @@ open_cache(share, staging_dir=None)  # always build beside the target
 ```
 
 Publishing still takes two steps, because **a rename cannot cross volumes**:
-`os.replace` raises `EXDEV` rather than silently copying. So the finished file is
+`os.replace` fails rather than silently copying. So the finished file is
 copied to a temp *beside* the target and renamed there. Readers still only ever
 see the whole old file or the whole new one — the copy lands under a name
 nothing looks for, and the rename within the share is atomic as always.

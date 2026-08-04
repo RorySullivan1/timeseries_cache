@@ -177,8 +177,9 @@ assert not list((root / "local_staging").iterdir())  # staging is left clean
 
 Parquet encoding and the fsync happen on local disk. Publishing then copies the
 finished file to a temp *beside* the target and renames it there — two steps,
-because **a rename cannot cross volumes** (`os.replace` raises `EXDEV` rather
-than silently copying). The rename within the share is still atomic, so a reader
+because **a rename cannot cross volumes** — `os.replace` fails rather than
+silently copying, as `EXDEV` on POSIX and `WinError 17` on Windows, which do
+*not* share an `errno`. The rename within the share is still atomic, so a reader
 never sees a partial file.
 
 The fsync is the part that matters most. A network redirector may refuse

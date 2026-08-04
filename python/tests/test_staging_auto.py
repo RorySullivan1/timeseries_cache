@@ -149,6 +149,80 @@ class TestTheFsyncThatCrossedTheWire:
         )
 
 
+class TestCrossVolumeDetection:
+    """Windows spells "cannot cross volumes" differently, and the difference is
+    only reachable on a share with staging on — nowhere a POSIX runner goes.
+
+    The reported failure: ``WinError 17`` escaping ``_publish`` as a hard error
+    instead of triggering the copy-then-rename fallback it exists for, because
+    the guard tested ``errno == EXDEV`` and Windows had not set that errno.
+    """
+
+    @staticmethod
+    def _windows_error() -> OSError:
+        """What os.replace raises across volumes on Windows: winerror 17, and
+        an errno that is *not* EXDEV."""
+        error = OSError(errno.EINVAL, "cannot move the file to a different disk drive")
+        error.winerror = 17  # type: ignore[attr-defined]
+        return error
+
+    def test_the_posix_spelling_is_recognized(self):
+        assert ParquetBackend._is_cross_volume(
+            OSError(errno.EXDEV, "Invalid cross-device link")
+        )
+
+    def test_the_windows_spelling_is_recognized(self):
+        assert ParquetBackend._is_cross_volume(self._windows_error())
+
+    def test_an_unrelated_error_is_not(self):
+        """The guard must stay narrow: re-raising is right for everything else,
+        and swallowing a permission error into a copy would hide it."""
+        assert not ParquetBackend._is_cross_volume(
+            PermissionError(errno.EACCES, "Access is denied")
+        )
+        assert not ParquetBackend._is_cross_volume(OSError(errno.ENOENT, "missing"))
+
+    def test_a_windows_cross_volume_rename_falls_back_to_copy_and_rename(
+        self, tmp_path, monkeypatch
+    ):
+        """End to end: the write must land, not raise."""
+        real_replace = os.replace
+        windows_error = self._windows_error()
+
+        def replace(src, dst, *args, **kwargs):
+            if Path(src).parent != Path(dst).parent:
+                raise windows_error
+            return real_replace(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(os, "replace", replace)
+
+        staging = tmp_path / "local"
+        share = tmp_path / "share"
+        share.mkdir()
+        target = share / "data.parquet"
+
+        ParquetBackend._atomic_write(
+            target, lambda p: p.write_bytes(b"payload"), staging_dir=staging
+        )
+
+        assert target.read_bytes() == b"payload"
+        assert list(share.iterdir()) == [target]
+        assert not list(staging.iterdir())
+
+    def test_an_unrelated_rename_failure_still_propagates(self, tmp_path, monkeypatch):
+        """Widening the guard must not turn every rename failure into a copy."""
+
+        def replace(src, dst, *args, **kwargs):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(os, "replace", replace)
+
+        with pytest.raises(OSError, match="No space left"):
+            ParquetBackend._atomic_write(
+                tmp_path / "data.parquet", lambda p: p.write_bytes(b"x")
+            )
+
+
 class TestTheBuildSideFsyncStaysStrict:
     def test_a_build_directory_that_refuses_fsync_raises(self, tmp_path, monkeypatch):
         """Unlike the publish-side flush. If this one fails the data genuinely

@@ -134,7 +134,7 @@ direction:
   invariant exists to forbid. `StorageBackend.write` takes `manifest_first` for this.
 
 The atomic step is always a **same-volume rename**. A rename cannot cross volumes —
-`os.replace` raises `EXDEV` — so when a file is built elsewhere (`staging_dir`, for a
+`os.replace` fails rather than copying — so when a file is built elsewhere (`staging_dir`, for a
 network root) it is copied to a temp beside the target first and renamed from there.
 Never publish by copying straight onto the target: that is the one shape where a
 reader can observe a half-written file.
@@ -238,6 +238,12 @@ Documented in `python/README.md` and deliberate — don't "fix" them without ask
   rescues a share ACL'd without delete rights, since a rename *is* a delete. Reads
   are unimproved by any of it — a local `root` is still the better answer where
   it's an option.
+- **"Cannot cross volumes" has two spellings and no shared `errno`.** POSIX
+  raises `EXDEV`; Windows raises `ERROR_NOT_SAME_DEVICE` (`WinError 17`) and does
+  not reliably translate it. `_is_cross_volume` checks both, and must keep doing
+  so — an `errno`-only test lets the exact case the copy-then-rename fallback
+  exists for escape as a hard error, on Windows, against a share, which is the
+  one configuration no test runner here can reach.
 - **`os.fsync` is not available on every filesystem.** A network redirector may
   refuse it outright (SMB/DFS return EBADF or EINVAL), so *where* a file is flushed
   decides whether a write can succeed at all. Two flushes, two rules, and they must
