@@ -45,6 +45,19 @@ class SchemaMismatchError(TimeseriesCacheError):
     """An incoming frame's schema disagrees with what the key already holds."""
 
 
+class UnknownKeyError(TimeseriesCacheError):
+    """An operation needs a key that has never been written."""
+
+
+class SchemaForcedWarning(UserWarning):
+    """A forced conversion lost something.
+
+    Only raised under ``schema_policy="force"`` and only when loss actually
+    occurred, so it stays a signal rather than noise. Forcing is opt-in, but it
+    is never silent — a value that became null or changed is reported here.
+    """
+
+
 class OverlappingWriteError(TimeseriesCacheError):
     """An ``append_only`` write overlaps coverage the cache already has."""
 

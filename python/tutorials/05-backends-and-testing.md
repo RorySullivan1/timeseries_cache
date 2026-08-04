@@ -241,8 +241,59 @@ with pytest.raises(SchemaMismatchError):  # 'cheap' would become null
 Text sits outside the round-trip rule on purpose: `"1.50"` parsed to `1.5` and
 printed back is `"1.5"`, a difference in spelling rather than in data. And
 conforming settles dtypes only — an added or dropped column is a migration, not
-an inference artifact, and is still refused. `conform_schema=False` turns the
-whole thing off and demands exact dtypes.
+an inference artifact, and is still refused.
+
+### When the stored dtype is the wrong one
+
+All of that assumes the key got its types right. Sometimes it didn't: the first
+write that ever landed typed a column from a bad sample, and now correct data
+can't get in. `schema_policy` picks the way out — `"lossless"` (the default
+above), `"strict"` (exact match), or `"force"`.
+
+`force` makes the batch fit whatever the key says, accepting the loss. It never
+does so quietly:
+
+```python
+import warnings
+
+from timeseries_cache import SchemaForcedWarning
+
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    whole.write(one(2, 1.5, pl.Float64), schema_policy="force", ticker="AAPL")
+
+assert issubclass(caught[0].category, SchemaForcedWarning)
+assert "1 value(s) changed" in str(caught[0].message)
+assert whole.read(ticker="AAPL").frame["close"].to_list() == [100, 1]  # 1.5 -> 1
+```
+
+`recast()` fixes the *key* instead, once, so nothing has to be forced again —
+and unlike a write, it can migrate the column set:
+
+```python
+report = whole.recast({"close": pl.Float64}, add={"volume": pl.Int64}, ticker="AAPL")
+
+assert report.retyped == {"close": ("Int64", "Float64")}
+assert report.added == {"volume": "Int64"}
+assert not report.lost_anything
+
+# The write that was failing now simply works.
+wider = pl.DataFrame(
+    {"ts": [BASE + timedelta(days=3)], "close": [103.5], "volume": [7]},
+    schema={"ts": TS, "close": pl.Float64, "volume": pl.Int64},
+)
+whole.write(wider, ticker="AAPL")
+assert whole.read(ticker="AAPL").frame["close"].to_list() == [100.0, 1.0, 103.5]
+```
+
+A recast that would lose data raises unless you pass `force=True`, which then
+reports what it cost in `report.nulled` and `report.altered`. **Coverage is
+untouched** either way — retyping a column says nothing about which ranges have
+been fetched.
+
+Prefer `recast` to `force`: forcing pays the loss on every write, a recast pays
+it once. Through the pandas facade `recast` takes pandas dtypes
+(`{"close": "float64"}`), so migrating a key never means importing polars.
 
 ## Durability
 

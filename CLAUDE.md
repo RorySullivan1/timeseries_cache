@@ -210,6 +210,18 @@ most consumers here are pandas.
   fails a gate raises `SchemaMismatchError`.
 - **Conforming settles dtypes, never the set of columns.** An added or dropped column
   is a migration, not an inference artifact, and is still refused.
+- **A write never changes the stored schema; `recast()` does.** `schema_policy`
+  (`lossless` default / `strict` / `force`, settable per cache or per write) governs
+  how far a *batch* bends toward the key. `force` bends it all the way — nulling what
+  won't convert, accepting truncation — for the case where the stored dtype is wrong
+  but the data has to land. It is never silent: real loss raises
+  `SchemaForcedWarning` naming the column, both dtypes, and the counts.
+  `recast(dtypes=, add=, drop=, force=)` is the other direction — it fixes the
+  *stored* schema once, and is the answer whenever the key is what's wrong, since
+  forcing pays the loss on every write. Two rules `recast` must keep: **coverage is
+  untouched** (a dtype says nothing about what has been fetched), and retyping a
+  row-key column re-canonicalizes, because a retype can reorder rows (`"10"` < `"9"`
+  as text) or collide two identities.
 
 ### Accepted limitations
 
@@ -226,11 +238,10 @@ Documented in `python/README.md` and deliberate — don't "fix" them without ask
   of it — a local `root` is still the better answer where it's an option.
 - **Whole-key rewrite on write.** Reads scale (pushdown); writes scale with key size,
   not change size. The answer is more keys, not a rewrite of the storage model.
-- **The column set is fixed per key.** Adding or dropping one is refused, not
-  migrated. Dtypes are *not* fixed in the same way — an incoming column conforms to
-  the stored dtype where that is provably lossless, and a column stored as `Null` is
-  settled by the first write carrying values (see the schema rules above). What is
-  fixed is the *stored* type: conforming never retypes what is already on disk.
+- **A write never changes the stored schema.** Added or dropped columns are refused
+  and conforming never retypes what is on disk; migration is `recast()`'s job and is
+  explicit. `identity_columns` is the one thing `recast` won't change either — a key
+  cannot change its notion of row identity in place.
 
 ## Tooling
 
@@ -284,6 +295,10 @@ and its second class is the important one: every conversion polars performs *sil
 (`1.5` → `1`, `5` → `True`, µs → ms, integers past 2⁵³, `"cheap"` → null) has a test
 asserting the write is refused. A change that makes any of those pass is data loss,
 not a relaxation — they are the reason conforming can be a default at all.
+`tests/test_schema_force.py` covers the escape hatches, and the cases that matter
+there are the ones keeping them honest: a forced write that loses nothing must *not*
+warn (or the warning stops being read), a forced write must not retype the key, and
+a recast must preserve coverage and re-canonicalize a retyped row-key column.
 
 Both facades must be tested against the same behavioral cases — parametrize over them
 rather than testing polars deeply and pandas shallowly. The pandas facade additionally

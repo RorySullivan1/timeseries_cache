@@ -16,8 +16,9 @@ gate it, and the tests below are organized around them:
    is what catches the conversions polars performs silently: 1.5 -> 1,
    5 -> True, microseconds -> milliseconds, and integers past 2**53.
 
-`conform_schema=False` opts out and demands an exact match, which is what the
-cache did before.
+`schema_policy` picks how much latitude the batch gets: "lossless" (default) is
+the above, "strict" demands an exact match, and "force" converts anyway and
+accepts the loss (``tests/test_schema_force.py``).
 """
 
 from __future__ import annotations
@@ -201,16 +202,16 @@ class TestLossyDifferencesStillRaise:
 
 
 class TestOptingOut:
-    def test_conform_schema_false_demands_an_exact_match(self, backend):
-        cache = TimeseriesCache(backend, conform_schema=False)
+    def test_strict_demands_an_exact_match(self, backend):
+        cache = TimeseriesCache(backend, schema_policy="strict")
         cache.write(typed([1], [101.5], pl.Float64), **SERIES)
         with pytest.raises(SchemaMismatchError, match="stored as"):
             cache.write(typed([2], [102], pl.Int64), **SERIES)
 
-    def test_all_null_settling_still_applies_when_not_conforming(self, backend):
+    def test_all_null_settling_still_applies_under_strict(self, backend):
         """The two rules are independent. An all-null column carries no type at
         all, so its reconciliation is not a conversion and is not opted out of."""
-        cache = TimeseriesCache(backend, conform_schema=False)
+        cache = TimeseriesCache(backend, schema_policy="strict")
         cache.write(typed([1], [101.5], pl.Float64), **SERIES)
         cache.write(typed([2], [None], pl.String), **SERIES)
 

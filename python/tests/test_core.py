@@ -460,12 +460,12 @@ class TestReservedKwargs:
 
 
 class TestSchema:
-    def test_rejects_a_changed_dtype_when_not_conforming(self, backend):
-        """With ``conform_schema=False`` the stored dtype must be matched exactly.
+    def test_rejects_a_changed_dtype_under_strict(self, backend):
+        """With ``schema_policy="strict"`` the stored dtype must match exactly.
 
         The default conforms instead — see ``tests/test_schema_conform.py``.
         """
-        cache = TimeseriesCache(backend, conform_schema=False)
+        cache = TimeseriesCache(backend, schema_policy="strict")
         cache.write(frame([1]), **SERIES)
         changed = frame([2]).with_columns(pl.col("price").cast(pl.Int64))
         with pytest.raises(SchemaMismatchError, match="stored as"):
