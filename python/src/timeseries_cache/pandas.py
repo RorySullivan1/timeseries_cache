@@ -10,7 +10,7 @@ Requires the ``pandas`` extra (``pip install timeseries-cache[pandas]``).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -19,7 +19,13 @@ import pandas as pd
 import polars as pl
 
 from .backends.base import StorageBackend
-from .core import DEFAULT_TIMESTAMP_COLUMN, TimeseriesCache, WriteMode
+from .core import (
+    DEFAULT_TIMESTAMP_COLUMN,
+    RecastReport,
+    SchemaPolicy,
+    TimeseriesCache,
+    WriteMode,
+)
 from .errors import IndexContractError
 from .index import Manifest
 from .intervals import Interval, IntervalSet
@@ -53,12 +59,14 @@ class PandasTimeseriesCache:
         *,
         timestamp_column: str = DEFAULT_TIMESTAMP_COLUMN,
         identity_columns: Sequence[str] = (),
-        conform_schema: bool = True,
+        schema_policy: SchemaPolicy | str = SchemaPolicy.LOSSLESS,
+        conform_schema: bool | None = None,
     ) -> None:
         self._cache = TimeseriesCache(
             backend,
             timestamp_column=timestamp_column,
             identity_columns=identity_columns,
+            schema_policy=schema_policy,
             conform_schema=conform_schema,
         )
 
@@ -198,10 +206,67 @@ class PandasTimeseriesCache:
         start: datetime | None = None,
         end: datetime | None = None,
         mode: WriteMode | str = WriteMode.UPSERT,
+        schema_policy: SchemaPolicy | str | None = None,
         **kwargs: Any,
     ) -> Interval:
         return self._cache.write(
-            self._to_polars(frame), start=start, end=end, mode=mode, **kwargs
+            self._to_polars(frame),
+            start=start,
+            end=end,
+            mode=mode,
+            schema_policy=schema_policy,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _as_polars_dtype(dtype: Any) -> pl.DataType:
+        """Translate a pandas dtype into the polars dtype it round-trips as.
+
+        Done by converting an empty Series rather than by a lookup table, so
+        the answer is by construction the dtype this facade would actually
+        produce for such a column — no table to drift out of step with pandas
+        or polars releases. Keeping the translation here is what lets a caller
+        recast without importing polars, per this module's contract.
+        """
+        if isinstance(dtype, pl.DataType):
+            return dtype
+        try:
+            empty = pd.Series([], dtype=dtype)
+        except TypeError as exc:
+            raise ValueError(f"{dtype!r} is not a pandas dtype") from exc
+        translated: pl.DataType = pl.from_pandas(empty.to_frame("v")).schema["v"]
+        return translated
+
+    @classmethod
+    def _as_polars_dtypes(
+        cls, mapping: Mapping[str, Any] | None
+    ) -> dict[str, pl.DataType] | None:
+        if mapping is None:
+            return None
+        return {name: cls._as_polars_dtype(dtype) for name, dtype in mapping.items()}
+
+    def recast(
+        self,
+        dtypes: Mapping[str, Any] | None = None,
+        *,
+        add: Mapping[str, Any] | None = None,
+        drop: Sequence[str] = (),
+        force: bool = False,
+        **kwargs: Any,
+    ) -> RecastReport:
+        """Change a key's stored schema in place. Takes **pandas** dtypes.
+
+        ``cache.recast({"price": "float64"}, ticker="AAPL")`` — see
+        :meth:`~timeseries_cache.core.TimeseriesCache.recast` for the semantics.
+        The reported dtypes are the stored (polars) ones, since those are what
+        the key actually holds.
+        """
+        return self._cache.recast(
+            self._as_polars_dtypes(dtypes),
+            add=self._as_polars_dtypes(add),
+            drop=drop,
+            force=force,
+            **kwargs,
         )
 
     def delete(

@@ -175,11 +175,57 @@ and printed back is `"1.5"`, a difference in spelling, not in data.
 Conforming settles dtypes and nothing else. An added or dropped column is a
 migration, not an inference artifact, and is still refused.
 
-To demand exact dtypes on every write instead:
+### When the *stored* dtype is the wrong one
+
+The rules above assume the key got it right. Sometimes it didn't — the first
+write that ever landed typed a column from a bad sample, and now correct data
+can't get in. Two ways out, and `schema_policy` picks between them:
+
+| policy | behavior |
+|---|---|
+| `"lossless"` | the default above: conform where nothing can be lost, else raise |
+| `"strict"` | require an exact dtype match, as the cache did originally |
+| `"force"` | conform regardless, accepting the loss |
+
+`force` makes *this batch* fit the stored dtype whatever it costs. Values that
+won't convert become null, truncating conversions go through. It is never
+silent — whatever was actually lost comes back as a `SchemaForcedWarning`:
 
 ```python
-cache = open_cache(root, conform_schema=False)
+cache.write(batch, schema_policy="force", **series)
+# SchemaForcedWarning: forcing 'price' from String to the stored Float64:
+# 3 value(s) became null. Use recast() if the stored dtype is the wrong one.
 ```
+
+Set it per write, as above, or as the cache's default with
+`open_cache(root, schema_policy="force")`.
+
+`recast()` fixes the *stored dtype itself*, once, so nothing has to be forced
+again:
+
+```python
+report = cache.recast({"price": pl.Float64}, **series)
+report.retyped  # {'price': ('Int64', 'Float64')}
+report.lost_anything  # False
+```
+
+It also migrates the column set, which conforming deliberately won't:
+
+```python
+cache.recast(add={"volume": pl.Int64}, drop=["stale"], **series)
+```
+
+A recast that would lose data raises, with a count of what it would have cost;
+`force=True` accepts it and reports the damage in `report.nulled` and
+`report.altered`. **Coverage is untouched** either way — a dtype says nothing
+about which ranges have been fetched.
+
+Prefer `recast` to `force`. Forcing pays the loss on every write; a recast pays
+it once, deliberately, and then the writes that were failing simply work.
+
+Through the pandas facade, `recast` takes pandas dtypes —
+`cache.recast({"price": "float64"}, **series)` — so migrating a key never
+requires importing polars.
 
 ## Layout
 
@@ -300,11 +346,11 @@ publish results to the share.
   well (the time predicate pushes down); writes scale with the size of the key,
   not the size of the change. Partition into more keys, or across time, if a
   single key grows large enough for that to hurt.
-- **The column set is fixed per key.** Adding or dropping one is refused rather
-  than migrated — delete the key or migrate it deliberately. The same goes for
-  `identity_columns`: a key can't change its notion of row identity in place.
-  Dtypes are the exception: an incoming column conforms to the stored one where
-  that is lossless (above), but the *stored* type never changes.
+- **A write never changes the stored schema.** An incoming column conforms to
+  the stored dtype where that is lossless, and an added or dropped column is
+  refused. Changing what a key holds is `recast()`'s job, and is deliberate by
+  design. The one thing `recast` won't do is change `identity_columns` — a key
+  can't change its notion of row identity in place.
 
 ## Development
 

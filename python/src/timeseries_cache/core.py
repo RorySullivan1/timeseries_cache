@@ -7,8 +7,9 @@ bytes land in parquet, in memory, or somewhere not written yet.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+import warnings
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
@@ -20,7 +21,9 @@ from .errors import (
     IndexContractError,
     InvalidIdentityError,
     OverlappingWriteError,
+    SchemaForcedWarning,
     SchemaMismatchError,
+    UnknownKeyError,
     WindowError,
 )
 from .index import Manifest
@@ -72,6 +75,65 @@ class WriteMode(StrEnum):
     overlap means a bug upstream."""
 
 
+class SchemaPolicy(StrEnum):
+    """How an incoming column's dtype reconciles with the one already stored.
+
+    The stored dtype is the key's schema; a batch's dtypes are a guess made from
+    the values in that batch alone. What differs between these is how much
+    latitude the batch gets to be wrong about it.
+    """
+
+    STRICT = "strict"
+    """Require an exact match. Any difference raises."""
+
+    LOSSLESS = "lossless"
+    """Conform to the stored dtype where that is *provably lossless for the
+    values present*, and raise otherwise. The default, and the only setting
+    that can never change a value."""
+
+    FORCE = "force"
+    """Conform regardless, accepting the loss.
+
+    The escape hatch for a key whose stored dtype is wrong but is not worth a
+    migration, or for data that must land now. Values that will not convert
+    become **null**, and conversions that change a value (1.5 -> 1) go through.
+    Never silent: whatever is actually lost is reported as a
+    :class:`~timeseries_cache.errors.SchemaForcedWarning`.
+
+    Prefer :meth:`TimeseriesCache.recast` when the stored dtype is the thing
+    that is wrong — forcing loses data on every write, a recast fixes it once.
+    """
+
+
+@dataclass(frozen=True)
+class RecastReport:
+    """What a :meth:`TimeseriesCache.recast` actually did."""
+
+    retyped: dict[str, tuple[str, str]] = field(default_factory=dict)
+    """``column -> (before, after)`` for every dtype that changed."""
+
+    added: dict[str, str] = field(default_factory=dict)
+    """Columns created, filled with null, and the dtype they were created as."""
+
+    dropped: tuple[str, ...] = ()
+    """Columns removed from the key."""
+
+    nulled: dict[str, int] = field(default_factory=dict)
+    """Values that became null because they would not convert. Only a forced
+    recast can produce these; an unforced one refuses instead."""
+
+    altered: dict[str, int] = field(default_factory=dict)
+    """Values that converted but came out different — 1.5 stored as 1. Again
+    only reachable under ``force``."""
+
+    row_count: int = 0
+
+    @property
+    def lost_anything(self) -> bool:
+        """True when the recast changed data rather than only its type."""
+        return bool(self.nulled or self.altered)
+
+
 @dataclass(frozen=True)
 class ReadResult:
     """Rows, plus what the cache does *not* know about the requested range."""
@@ -108,13 +170,13 @@ class TimeseriesCache:
             ``(timestamp, *identity_columns)`` the unit of uniqueness *and* the
             unit an ``upsert`` overwrites. Coverage stays purely time-based
             either way; only row identity changes.
-        conform_schema: When true (the default), a column whose dtype differs
-            from the one already stored is cast to the stored dtype, provided
-            the cast is **provably lossless** for the values present. A batch
-            that infers ``Int64`` where the key holds ``Float64`` then lands
-            instead of raising. A cast that would lose anything still raises
-            :class:`~timeseries_cache.errors.SchemaMismatchError`. Set false to
-            require every write to arrive already matching the stored dtypes.
+        schema_policy: How an incoming dtype reconciles with the stored one —
+            see :class:`SchemaPolicy`. ``"lossless"`` (the default) conforms
+            where nothing can be lost, ``"strict"`` demands an exact match, and
+            ``"force"`` conforms regardless. Any write may override this for
+            one call.
+        conform_schema: Deprecated alias for ``schema_policy``; ``True`` means
+            ``"lossless"`` and ``False`` means ``"strict"``.
     """
 
     def __init__(
@@ -123,8 +185,24 @@ class TimeseriesCache:
         *,
         timestamp_column: str = DEFAULT_TIMESTAMP_COLUMN,
         identity_columns: Sequence[str] = (),
-        conform_schema: bool = True,
+        schema_policy: SchemaPolicy | str = SchemaPolicy.LOSSLESS,
+        conform_schema: bool | None = None,
     ) -> None:
+        if conform_schema is not None:
+            if schema_policy != SchemaPolicy.LOSSLESS:
+                raise ValueError(
+                    "pass schema_policy or conform_schema, not both; "
+                    "conform_schema is the deprecated spelling"
+                )
+            warnings.warn(
+                "conform_schema is deprecated; use "
+                f"schema_policy={'lossless' if conform_schema else 'strict'!r}",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            schema_policy = (
+                SchemaPolicy.LOSSLESS if conform_schema else SchemaPolicy.STRICT
+            )
         if timestamp_column in identity_columns:
             raise InvalidIdentityError(
                 f"{timestamp_column!r} is the timestamp column and is always part "
@@ -138,7 +216,7 @@ class TimeseriesCache:
         self.backend = backend
         self.timestamp_column = timestamp_column
         self.identity_columns = tuple(identity_columns)
-        self.conform_schema = conform_schema
+        self.schema_policy = SchemaPolicy(schema_policy)
 
     @property
     def row_key(self) -> tuple[str, ...]:
@@ -329,8 +407,56 @@ class TimeseriesCache:
             return False
         return bool(returned.eq_missing(column).all())
 
+    @classmethod
+    def _loss(
+        cls, column: pl.Series, target: pl.DataType
+    ) -> tuple[pl.Series, int, int]:
+        """Convert leniently and measure what that cost.
+
+        Returns the converted column, how many values became null, and how many
+        converted to something different. Both counts are zero exactly when the
+        conversion was lossless, which is what makes this usable as the report
+        for a forced write as well as the check for an unforced one.
+        """
+        converted = column.cast(target, strict=False)
+        nulled = converted.null_count() - column.null_count()
+        altered = 0
+        if cls._is_exact(column.dtype) and cls._is_exact(target):
+            try:
+                returned = converted.cast(column.dtype, strict=False)
+            except pl.exceptions.PolarsError:
+                # Unverifiable. Report nothing rather than guess a number; the
+                # caller's own gate has already refused this pairing unforced.
+                return converted, nulled, altered
+            survived = returned.eq_missing(column)
+            altered = int((~survived).sum()) - nulled
+        return converted, nulled, max(altered, 0)
+
+    def _force_to_stored(
+        self, name: str, column: pl.Series, target: pl.DataType
+    ) -> pl.Series:
+        """Cast regardless, and say out loud what it cost."""
+        converted, nulled, altered = self._loss(column, target)
+        if nulled or altered:
+            complaint = []
+            if nulled:
+                complaint.append(f"{nulled} value(s) became null")
+            if altered:
+                complaint.append(f"{altered} value(s) changed")
+            warnings.warn(
+                f"forcing {name!r} from {column.dtype} to the stored {target}: "
+                + " and ".join(complaint)
+                + ". Use recast() if the stored dtype is the wrong one.",
+                SchemaForcedWarning,
+                stacklevel=4,
+            )
+        return converted
+
     def _conform_to_stored(
-        self, frame: pl.DataFrame, stored: pl.Schema | None
+        self,
+        frame: pl.DataFrame,
+        stored: pl.Schema | None,
+        policy: SchemaPolicy = SchemaPolicy.LOSSLESS,
     ) -> pl.DataFrame:
         """Cast columns to the dtypes already stored, where that loses nothing.
 
@@ -351,10 +477,15 @@ class TimeseriesCache:
         - between types with exact representations it must also round-trip, so
           ``1.5`` -> ``Int64`` is refused rather than silently truncated.
 
-        Anything that fails those tests is a genuine disagreement and raises.
+        Anything that fails those tests is a genuine disagreement and raises —
+        unless ``policy`` is ``force``, which converts anyway and reports the
+        damage as a :class:`~timeseries_cache.errors.SchemaForcedWarning`. That
+        is the escape hatch for a key whose stored dtype is wrong; the better
+        answer for a wrong stored dtype is :meth:`recast`.
         """
-        if stored is None:
+        if stored is None or policy is SchemaPolicy.STRICT:
             return frame
+        replacements: list[pl.Series] = []
         casts: list[pl.Expr] = []
         for name, dtype in frame.schema.items():
             if name not in stored:
@@ -367,20 +498,29 @@ class TimeseriesCache:
                 # No values to lose; the all-null path already settled this.
                 casts.append(pl.col(name).cast(target))
                 continue
+            if policy is SchemaPolicy.FORCE:
+                replacements.append(
+                    self._force_to_stored(name, column, target).alias(name)
+                )
+                continue
             try:
                 converted = column.cast(target)
             except pl.exceptions.PolarsError:
                 raise SchemaMismatchError(
                     f"{name!r} arrived as {dtype} and the key stores {target}, "
-                    f"and the values do not convert. Fix the source's types, or "
-                    f"pass conform_schema=False to require an exact match."
+                    f"and the values do not convert. Fix the source's types, "
+                    f'pass schema_policy="strict" to require an exact match, '
+                    f'or schema_policy="force" to convert anyway and accept '
+                    f"the loss."
                 ) from None
             if converted.null_count() != column.null_count():
                 raise SchemaMismatchError(
                     f"{name!r} arrived as {dtype} and the key stores {target}; "
                     f"converting would turn "
                     f"{converted.null_count() - column.null_count()} value(s) "
-                    f"into null. Refusing rather than losing them."
+                    f"into null. Refusing rather than losing them — pass "
+                    f'schema_policy="force" to accept it, or recast() the key '
+                    f"if the stored dtype is the wrong one."
                 )
             if (
                 self._is_exact(dtype)
@@ -392,10 +532,15 @@ class TimeseriesCache:
                     f"but the values do not survive the conversion — it would "
                     f"change them (truncating 1.5 to 1, 5 to True, or a "
                     f"microsecond to a millisecond). Send the column as "
-                    f"{target}, or store it as {dtype} under a new key."
+                    f'{target}, pass schema_policy="force" to accept the '
+                    f"change, or recast() the key to {dtype}."
                 )
             casts.append(pl.col(name).cast(target))
-        return frame.with_columns(casts) if casts else frame
+        if casts:
+            frame = frame.with_columns(casts)
+        if replacements:
+            frame = frame.with_columns(replacements)
+        return frame
 
     def _check_schema(self, stored: dict[str, str] | None, frame: pl.DataFrame) -> None:
         """Compare an incoming frame against the schema already on disk.
@@ -614,13 +759,19 @@ class TimeseriesCache:
         start: datetime | None = None,
         end: datetime | None = None,
         mode: WriteMode | str = WriteMode.UPSERT,
+        schema_policy: SchemaPolicy | str | None = None,
         **kwargs: Any,
     ) -> Interval:
         """Merge ``frame`` into the key and record the window it covers.
 
-        Returns the window now marked covered.
+        ``schema_policy`` overrides the cache's default for this one write —
+        ``"force"`` to make a batch fit a stored dtype it disagrees with,
+        accepting the loss. Returns the window now marked covered.
         """
         mode = WriteMode(mode)
+        policy = (
+            self.schema_policy if schema_policy is None else SchemaPolicy(schema_policy)
+        )
         key = self._key(kwargs)
         manifest = self._manifest(key)
 
@@ -647,10 +798,9 @@ class TimeseriesCache:
             # Settle all-null columns against what is already known *before*
             # checking, so an inference artifact never reads as a schema change.
             incoming = self._reconcile_null_typing(incoming, live)
-            if self.conform_schema:
-                # The stored dtypes are the key's schema; a batch's inferred
-                # dtypes are a guess. Defer to the former where nothing is lost.
-                incoming = self._conform_to_stored(incoming, live)
+            # The stored dtypes are the key's schema; a batch's inferred dtypes
+            # are a guess. Defer to the former, as far as `policy` allows.
+            incoming = self._conform_to_stored(incoming, live, policy)
             stored = (
                 {name: str(dtype) for name, dtype in live.items()}
                 if live is not None
@@ -765,6 +915,169 @@ class TimeseriesCache:
                 "your data"
             )
         return merged
+
+    # ----------------------------------------------------------------- recast
+
+    def recast(
+        self,
+        dtypes: Mapping[str, pl.DataType] | None = None,
+        *,
+        add: Mapping[str, pl.DataType] | None = None,
+        drop: Sequence[str] = (),
+        force: bool = False,
+        **kwargs: Any,
+    ) -> RecastReport:
+        """Change a key's stored schema in place, deliberately.
+
+        The counterpart to conforming. Conforming makes a *batch* fit the key;
+        this makes the *key* fit what it should have been — for a column typed
+        wrongly by the first write that ever landed, or a source that has since
+        changed shape. Doing it once beats forcing every subsequent write, which
+        loses a little more data each time.
+
+        Deliberate is the operative word. Nothing here is inferred: name the
+        columns to retype, ``add`` (created null-filled) or ``drop``, and the
+        cache does exactly that and nothing else.
+
+        Args:
+            dtypes: ``column -> new dtype`` for columns that already exist.
+            add: ``column -> dtype`` for columns to create, filled with null.
+            drop: Columns to remove.
+            force: Convert even where values would be lost. Off by default: a
+                recast that would null out or alter values raises instead, with
+                a count of what it would have cost.
+
+        Returns:
+            A :class:`RecastReport` of what changed — including, under
+            ``force``, exactly how many values were lost.
+
+        Coverage is untouched. Retyping a column says nothing about which
+        ranges have been fetched, and conflating the two would put a hole in
+        the one thing the cache exists to get right.
+        """
+        dtypes = dict(dtypes or {})
+        add = dict(add or {})
+        drop = tuple(drop)
+
+        key = self._key(kwargs)
+        manifest = self._manifest(key)
+        if manifest is None:
+            raise UnknownKeyError(
+                f"no cached key for {kwargs!r}; there is no schema to recast"
+            )
+        lazy = self.backend.scan(key)
+        if lazy is None:
+            raise UnknownKeyError(
+                f"the key for {kwargs!r} holds no stored frame yet — write data "
+                "before recasting it"
+            )
+        frame = lazy.collect()
+        del lazy
+
+        self._validate_recast(frame, dtypes, add, drop)
+
+        report_retyped: dict[str, tuple[str, str]] = {}
+        nulled: dict[str, int] = {}
+        altered: dict[str, int] = {}
+        replacements: list[pl.Series] = []
+        for name, target in dtypes.items():
+            column = frame.get_column(name)
+            if column.dtype == target:
+                continue
+            converted, lost, changed = self._loss(column, target)
+            if (lost or changed) and not force:
+                cost = " and ".join(
+                    part
+                    for part in (
+                        f"null {lost} value(s)" if lost else "",
+                        f"change {changed} value(s)" if changed else "",
+                    )
+                    if part
+                )
+                raise SchemaMismatchError(
+                    f"recasting {name!r} from {column.dtype} to {target} would "
+                    f"{cost}. Pass force=True to accept that, or pick a dtype "
+                    "that fits the data."
+                )
+            report_retyped[name] = (str(column.dtype), str(target))
+            if lost:
+                nulled[name] = lost
+            if changed:
+                altered[name] = changed
+            replacements.append(converted.alias(name))
+
+        if replacements:
+            frame = frame.with_columns(replacements)
+        if drop:
+            frame = frame.drop(drop)
+        if add:
+            frame = frame.with_columns(
+                [pl.lit(None, dtype=dtype).alias(name) for name, dtype in add.items()]
+            )
+
+        # A retyped identity column can reorder rows ("10" < "9" as text, not as
+        # numbers) and a forced one can collide two ids into the same value.
+        # Both break the row-key invariants the rest of the cache assumes, so
+        # re-establish them here rather than leaving a key that reads back wrong.
+        if any(name in self.row_key for name in dtypes):
+            frame = self._canonicalize(frame)
+
+        updated = manifest.updated(
+            coverage=manifest.coverage,
+            schema=self._schema_of(frame),
+            row_count=frame.height,
+        )
+        self.backend.write(key, frame, updated)
+        return RecastReport(
+            retyped=report_retyped,
+            added={name: str(dtype) for name, dtype in add.items()},
+            dropped=drop,
+            nulled=nulled,
+            altered=altered,
+            row_count=frame.height,
+        )
+
+    def _validate_recast(
+        self,
+        frame: pl.DataFrame,
+        dtypes: Mapping[str, pl.DataType],
+        add: Mapping[str, pl.DataType],
+        drop: Sequence[str],
+    ) -> None:
+        """Refuse a recast that is malformed before touching any data."""
+        if not (dtypes or add or drop):
+            raise SchemaMismatchError(
+                "recast() needs at least one of dtypes, add, or drop"
+            )
+        stored = set(frame.columns)
+        if unknown := sorted(set(dtypes) - stored):
+            raise SchemaMismatchError(
+                f"cannot retype {unknown}: not stored. Available: "
+                f"{sorted(stored)}. Use add= to create a column."
+            )
+        if unknown := sorted(set(drop) - stored):
+            raise SchemaMismatchError(f"cannot drop {unknown}: not stored")
+        if clashing := sorted(set(add) & stored):
+            raise SchemaMismatchError(
+                f"cannot add {clashing}: already stored. Use dtypes= to retype."
+            )
+        for left, right, label in (
+            (set(dtypes), set(drop), "retyped and dropped"),
+            (set(add), set(drop), "added and dropped"),
+        ):
+            if overlap := sorted(left & right):
+                raise SchemaMismatchError(f"{overlap} cannot be both {label}")
+
+        if self.timestamp_column in set(dtypes) | set(add) | set(drop):
+            raise IndexContractError(
+                f"{self.timestamp_column!r} is the timestamp column; its dtype "
+                "is fixed by the index contract and it cannot be dropped"
+            )
+        if identity := sorted(set(drop) & set(self.identity_columns)):
+            raise InvalidIdentityError(
+                f"cannot drop identity column(s) {identity} — that would change "
+                "what a row is. Delete the key and rewrite it instead."
+            )
 
     # ----------------------------------------------------------------- delete
 
