@@ -1,8 +1,8 @@
 # MEMORY INDEX  ·  keep ≤ ~80 lines
 
 ## State            (rewrite in place — current truth only, ≤ ~10 lines)
-- `python/` is complete: 487 tests green, ruff + `mypy --strict` clean on 3.11/3.12/3.13. No other language port.
-- PRs #1-#7 all merged; main = `b613335`, verified green after merge. No branch in flight.
+- `python/` is complete: 499 tests green, ruff + `mypy --strict` clean on 3.11/3.12/3.13. No other language port.
+- PRs #1-#8 all merged; main = `0856258`, all six CI jobs green. No branch in flight.
 - CI matrix is 3.11/3.12/3.13 × ubuntu/windows. Tutorials are markdown under `python/tutorials/`.
 - Row identity is `(timestamp, *identity_columns)`; default `()` = timestamp alone, unchanged behavior.
 - Remote branch deletion returns 403 from this environment's git proxy — must be done in the GitHub UI.
@@ -44,10 +44,13 @@
 
 - [2026-08-04] Escape hatches for a *wrong stored dtype*: `schema_policy` (`strict`/`lossless`/`force`, per cache or per write) and `recast(dtypes=, add=, drop=, force=)`. `force` bends the batch, `recast` bends the key — prefer recast, since forcing pays the loss on every write. Force is never silent about real loss, warns about nothing when it loses nothing, and never retypes the key. `recast` must leave coverage untouched and must re-canonicalize a retyped row-key column (a retype reorders rows and can collide identities). — sessions/2026-08-04-1200-schema-force-and-recast.md
 
+- [2026-08-04] `staging_dir` defaults to `"auto"`: stage on local disk when the root looks remote (UNC, or `GetDriveTypeW == 4` via ctypes), build beside the target otherwise. **Two fsyncs, two opposite rules** — build-side strict (where durability is established), publish-side suppressed (source already durable locally; atomicity is the rename). Conflating them is what let a network fsync survive the #5 staging fix. Any new fsync call site must say which it is. — sessions/2026-08-04-1420-auto-local-staging.md
+
 ## Threads          (open items; remove when closed)
 - Hooks invoke `python`, not `python3`; will silently no-op on a `python3`-only machine.
 - **The user's DFS-share write failure is unconfirmed fixed** — they never ran `diagnose_windows.py`. Staging + retry target the most probable cause; that is inference, not a diagnosis.
 - All merged branches still on origin — deletion 403s from here, needs the GitHub UI.
+- **`ctypes.windll` is in the Windows stubs and not the POSIX ones**, so a `type: ignore` for it is unused *on Windows*. Use `getattr`. A green local Linux run proves nothing for platform-conditional code.
 - `scrAdmin` / gallery variant `CONFIRM_BlankVertical` is **not in this repo** — user raised it here; belongs to another of their repos. Asked which; unanswered.
 - Interval algebra + cache semantics were fuzzed once by hand and came back clean; worth wiring in as property tests rather than a one-off.
 - No second language port; the backend protocol + manifest JSON are the intended seam.
@@ -64,3 +67,4 @@
 - 2026-08-03 1550 | local staging + rename retry for DFS shares; all-null columns don't vote on the schema | sessions/2026-08-03-1550-network-staging-and-null-typing.md
 - 2026-08-03 1700 | incoming dtypes conform to the stored schema, gated on provable losslessness | sessions/2026-08-03-1700-conform-to-stored-schema.md
 - 2026-08-04 1200 | schema_policy=force + recast() for a wrong stored schema | sessions/2026-08-04-1200-schema-force-and-recast.md
+- 2026-08-04 1420 | auto local staging; the second fsync that still crossed the wire | sessions/2026-08-04-1420-auto-local-staging.md
