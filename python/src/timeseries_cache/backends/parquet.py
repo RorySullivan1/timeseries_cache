@@ -98,8 +98,17 @@ DRIVE_REMOTE: Final[int] = 4
 rather than pulled from pywin32, which the core deliberately does not depend on.
 """
 
+MANIFEST_NAME: Final[str] = LEGACY_MANIFEST
+DATA_NAME: Final[str] = LEGACY_DATA
+"""Kept so code written against the pre-generational layout still imports.
+
+They now name only the *legacy* files, which are read but never written.
+"""
+
 DEFAULT_CREATE_ATTEMPTS: Final[int] = 5
 DEFAULT_CREATE_BACKOFF: Final[float] = 0.1
+DEFAULT_REPLACE_ATTEMPTS: Final[int] = DEFAULT_CREATE_ATTEMPTS
+DEFAULT_REPLACE_BACKOFF: Final[float] = DEFAULT_CREATE_BACKOFF
 """Retry budget for creating a file.
 
 Much less load-bearing than the rename retry it replaces — a create does not
@@ -149,7 +158,16 @@ class ParquetBackend:
         create_attempts: int = DEFAULT_CREATE_ATTEMPTS,
         create_backoff: float = DEFAULT_CREATE_BACKOFF,
         staging_dir: str | os.PathLike[str] | Literal["auto"] | None = "auto",
+        replace_attempts: int | None = None,
+        replace_backoff: float | None = None,
     ) -> None:
+        # The rename retry became a create retry when publishing stopped
+        # renaming. Accepting the old spelling costs four lines and saves every
+        # caller a TypeError on upgrade.
+        if replace_attempts is not None:
+            create_attempts = replace_attempts
+        if replace_backoff is not None:
+            create_backoff = replace_backoff
         if create_attempts < 1:
             raise ValueError("create_attempts must be at least 1")
         self.root = Path(root)
@@ -230,11 +248,12 @@ class ParquetBackend:
         return directory / f"{DATA_PREFIX}{stamp}{DATA_SUFFIX}"
 
     @staticmethod
-    def _generations(directory: Path) -> list[int]:
-        """Every generation with a manifest file, newest first.
+    def _numbered(directory: Path, prefix: str, suffix: str) -> list[int]:
+        """Generation numbers of files named ``<prefix><digits><suffix>``.
 
         Name-based rather than content-based: finding the candidates must not
-        cost a read of each one.
+        cost a read of each one. A directory that does not exist is simply no
+        generations — a cold cache is a normal state, not an error.
         """
         try:
             entries = list(directory.iterdir())
@@ -243,14 +262,30 @@ class ParquetBackend:
         found: list[int] = []
         for entry in entries:
             name = entry.name
-            if not (
-                name.startswith(MANIFEST_PREFIX) and name.endswith(MANIFEST_SUFFIX)
-            ):
+            if not (name.startswith(prefix) and name.endswith(suffix)):
                 continue
-            token = name[len(MANIFEST_PREFIX) : -len(MANIFEST_SUFFIX)]
+            token = name[len(prefix) : -len(suffix)]
             if token.isdigit():
                 found.append(int(token))
         return sorted(found, reverse=True)
+
+    @classmethod
+    def _generations(cls, directory: Path) -> list[int]:
+        """Every generation with a manifest file, newest first."""
+        return cls._numbered(directory, MANIFEST_PREFIX, MANIFEST_SUFFIX)
+
+    @classmethod
+    def _occupied(cls, directory: Path) -> set[int]:
+        """Every generation number already in use, by *either* of its files.
+
+        Manifests alone are not enough. An interrupted write leaves a
+        ``data-<n>.parquet`` with no manifest, and treating that number as free
+        would overwrite it — which is a replace, the one thing this layout does
+        not do and the one thing a create-only share cannot permit.
+        """
+        return set(cls._numbered(directory, MANIFEST_PREFIX, MANIFEST_SUFFIX)) | set(
+            cls._numbered(directory, DATA_PREFIX, DATA_SUFFIX)
+        )
 
     @staticmethod
     def _load(path: Path) -> Manifest | None:
@@ -262,10 +297,13 @@ class ParquetBackend:
         brace is what is missing — so the generation is skipped and the reader
         falls back to the previous one.
 
-        Only structural failures are swallowed. A manifest from a *future*
-        format version is a real error and still raises: guessing at a layout
-        this build does not understand is how a cache silently serves wrong
-        data.
+        Only *structural* failures are swallowed — the shapes a torn write
+        produces. A manifest from a future format version raises
+        :class:`~timeseries_cache.errors.ManifestVersionError`, which is not
+        caught here: it is a real error, and falling back to an older generation
+        would quietly serve stale data instead of reporting it. It has its own
+        class precisely so this distinction is not a substring match on a
+        message.
         """
         try:
             raw = path.read_text(encoding="utf-8")
@@ -273,9 +311,7 @@ class ParquetBackend:
             return None
         try:
             return Manifest.from_json(raw)
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
-            if isinstance(error, ValueError) and "format_version" in str(error):
-                raise
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             return None
 
     def _current(self, directory: Path) -> tuple[int, Manifest] | None:
@@ -369,7 +405,7 @@ class ParquetBackend:
         manifest is unparseable — reusing it would overwrite the evidence and,
         worse, be a replace.
         """
-        taken = set(self._generations(directory))
+        taken = self._occupied(directory)
         generation = max([current, *taken], default=0) + 1
         while generation in taken:
             generation += 1
@@ -476,7 +512,10 @@ class ParquetBackend:
         except OSError as error:
             if not strict:
                 return
-            raise OSError(
+            # Same class, not a bare OSError: a PermissionError here is a
+            # transient holder that `_attempt` is meant to retry, and rewrapping
+            # it would make that retry silently unreachable.
+            raise type(error)(
                 f"could not flush {path.name} in {path.parent}: {error}. A "
                 "filesystem that refuses fsync is almost always a network or "
                 'DFS share; build on local disk instead (staging_dir=r"C:\\temp", '
@@ -491,15 +530,38 @@ class ParquetBackend:
         without delete rights — costs disk space and nothing else. That is the
         whole reason publishing is a create: cleanup is allowed to fail.
         """
-        for generation in self._generations(directory):
+        for generation in sorted(self._occupied(directory)):
             if generation > published - 1 - KEEP_GENERATIONS:
                 continue
-            with contextlib.suppress(OSError):
-                self._manifest_path(directory, generation).unlink(missing_ok=True)
-            with contextlib.suppress(OSError):
-                self._data_path(directory, generation).unlink(missing_ok=True)
+            self._drop(
+                self._data_path(directory, generation),
+                self._manifest_path(directory, generation),
+            )
         if published > KEEP_GENERATIONS:
             # The pre-generational pair, once it is far enough behind.
-            for legacy in (directory / LEGACY_MANIFEST, directory / LEGACY_DATA):
-                with contextlib.suppress(OSError):
-                    legacy.unlink(missing_ok=True)
+            self._drop(directory / LEGACY_DATA, directory / LEGACY_MANIFEST)
+
+    @staticmethod
+    def _drop(data: Path, manifest: Path) -> None:
+        """Remove one generation, **manifest first**.
+
+        The order is load-bearing, because each unlink can fail independently on
+        a share and the two half-done states are not equally safe:
+
+        * *manifest gone, data left* — an orphaned parquet file. ``_generations``
+          never lists it, so it is invisible. Harmless, costs disk.
+        * *data gone, manifest left* — ``scan`` finds no data file and reads the
+          generation as a schema-less empty write, so its range comes back
+          "covered, and genuinely empty" rather than unknown. That is the silent
+          hole invariant 5 exists to forbid.
+
+        So the manifest goes first, and if it survives the delete the data is
+        left alone: better to keep a whole superseded generation than to strand
+        a coverage claim with nothing behind it.
+        """
+        with contextlib.suppress(OSError):
+            manifest.unlink(missing_ok=True)
+        if manifest.exists():
+            return
+        with contextlib.suppress(OSError):
+            data.unlink(missing_ok=True)

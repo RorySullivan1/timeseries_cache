@@ -466,3 +466,171 @@ class TestTheWholeCacheOverASimulatedShare:
             cache.write(frame([day]), **SERIES)
 
         assert cache.read(**SERIES).frame.height == 4
+
+
+class TestBugsFoundInReview:
+    """Each of these was a real defect in the first generational build.
+
+    They share a shape worth naming: the layout's guarantees are about *pairs*
+    of files, and every one of these came from treating one file of a pair as
+    if it stood alone.
+    """
+
+    def test_an_orphaned_data_file_does_not_get_its_number_reused(self, tmp_path):
+        """An interrupted write leaves data-<n> with no manifest. Reusing <n>
+        would overwrite it — a replace, which is the one thing this design does
+        not do, and the thing a create-only share cannot permit."""
+        cache = TimeseriesCache(ParquetBackend(tmp_path / "cache"))
+        cache.write(frame([1]), **SERIES)
+        directory = only_key(tmp_path / "cache")
+
+        orphan = ParquetBackend._data_path(directory, 9)
+        orphan.write_bytes(b"rows from an interrupted write")
+
+        cache.write(frame([2]), **SERIES)
+
+        assert orphan.read_bytes() == b"rows from an interrupted write", (
+            "the orphaned data file was overwritten"
+        )
+        assert max(ParquetBackend._generations(directory)) > 9
+
+    def test_a_partial_cleanup_never_strands_a_manifest_without_data(
+        self, tmp_path, monkeypatch
+    ):
+        """The silent hole, and the reason cleanup deletes the manifest first.
+
+        If the manifest delete fails and the data delete goes ahead anyway, the
+        surviving manifest still claims its range while `scan` finds no rows —
+        so the range reads as "covered, and genuinely empty" rather than
+        unknown. Simulated by a share that refuses to delete manifests.
+        """
+        cache = TimeseriesCache(ParquetBackend(tmp_path / "cache"))
+        for day in (1, 2, 3, 4):
+            cache.write(frame([day]), start=ts(day), end=ts(day), **SERIES)
+
+        directory = only_key(tmp_path / "cache")
+        real_unlink = Path.unlink
+
+        def refuse_manifests(self, *args, **kwargs):
+            if self.name.startswith(MANIFEST_PREFIX):
+                raise PermissionError(5, "Access is denied")
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", refuse_manifests)
+        cache.write(frame([5]), start=ts(5), end=ts(5), **SERIES)
+        monkeypatch.setattr(Path, "unlink", real_unlink)
+
+        for generation in ParquetBackend._generations(directory):
+            assert ParquetBackend._data_path(directory, generation).exists(), (
+                f"generation {generation} is a manifest with no data file; a "
+                "read of its range would answer 'covered and empty'"
+            )
+        # And the guarantee that actually matters, stated end to end.
+        assert cache.read(start=ts(1), end=ts(5), **SERIES).frame.height == 5
+
+    def test_an_orphaned_data_file_is_the_safe_half_of_a_partial_cleanup(
+        self, tmp_path, monkeypatch
+    ):
+        """The other direction is fine: a parquet file with no manifest is never
+        listed, so it costs disk and nothing else."""
+        cache = TimeseriesCache(ParquetBackend(tmp_path / "cache"))
+        for day in (1, 2, 3, 4):
+            cache.write(frame([day]), start=ts(day), end=ts(day), **SERIES)
+
+        real_unlink = Path.unlink
+
+        def refuse_data(self, *args, **kwargs):
+            if self.name.startswith(DATA_PREFIX):
+                raise PermissionError(5, "Access is denied")
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", refuse_data)
+        cache.write(frame([5]), start=ts(5), end=ts(5), **SERIES)
+        monkeypatch.setattr(Path, "unlink", real_unlink)
+
+        assert cache.read(start=ts(1), end=ts(5), **SERIES).frame.height == 5
+
+    def test_a_strict_flush_permission_error_is_still_retried(
+        self, tmp_path, monkeypatch
+    ):
+        """Wrapping the failure in a bare OSError put it outside the retry's
+        `except PermissionError`, making the retry unreachable on the
+        write-in-place path."""
+        calls = {"n": 0}
+        real_fsync = os.fsync
+
+        def flaky(fd):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise PermissionError(5, "Access is denied")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", flaky)
+
+        backend = ParquetBackend(
+            tmp_path / "cache", staging_dir=None, create_backoff=0.001
+        )
+        TimeseriesCache(backend).write(frame([1]), **SERIES)
+
+        assert calls["n"] > 1, "the transient denial should have been retried"
+
+    def test_the_old_constructor_spelling_still_works(self, tmp_path):
+        """`replace_attempts` predates the rename removal. Callers upgrading
+        should not get a TypeError before the cache does anything."""
+        backend = ParquetBackend(tmp_path, replace_attempts=3, replace_backoff=0.5)
+        assert backend.create_attempts == 3
+        assert backend.create_backoff == 0.5
+
+
+class TestAColdCacheIsNormal:
+    """Reading a cache that has never been written is the first thing every
+    caller does. It must be silent, not an error."""
+
+    def test_reading_a_root_that_does_not_exist(self, tmp_path):
+        cache = TimeseriesCache(ParquetBackend(tmp_path / "nothing" / "here"))
+        result = cache.read(start=ts(1), end=ts(5), **SERIES)
+
+        assert result.frame.height == 0
+        assert not result.is_complete, "an unwritten range is unknown, not empty"
+        assert result.missing
+
+    def test_the_accessors_on_a_cold_cache(self, tmp_path):
+        cache = TimeseriesCache(ParquetBackend(tmp_path / "cold"))
+
+        assert cache.manifest(**SERIES) is None
+        assert not cache.coverage(**SERIES)
+        assert list(cache.backend.digests()) == []
+
+    def test_deleting_from_a_cold_cache_is_a_no_op(self, tmp_path):
+        cache = TimeseriesCache(ParquetBackend(tmp_path / "cold"))
+        cache.delete(**SERIES)
+        cache.delete(start=ts(1), end=ts(2), **SERIES)
+
+    def test_the_first_write_creates_everything_it_needs(self, tmp_path):
+        cache = TimeseriesCache(ParquetBackend(tmp_path / "deep" / "nested" / "cache"))
+        cache.write(frame([1]), **SERIES)
+        assert cache.read(**SERIES).frame.height == 1
+
+    def test_a_manifest_from_the_future_is_reported_not_skipped(self, tmp_path):
+        """The one manifest failure that must not fall back a generation.
+
+        Treating it as "incomplete" would quietly serve stale rows instead of
+        saying the cache was written by a newer build.
+        """
+        import json
+
+        from timeseries_cache import ManifestVersionError
+
+        cache = TimeseriesCache(ParquetBackend(tmp_path / "cache"))
+        cache.write(frame([1]), **SERIES)
+        cache.write(frame([2]), **SERIES)
+
+        directory = only_key(tmp_path / "cache")
+        newest = max(ParquetBackend._generations(directory))
+        path = ParquetBackend._manifest_path(directory, newest)
+        payload = json.loads(path.read_text())
+        payload["format_version"] = 999
+        path.write_text(json.dumps(payload))
+
+        with pytest.raises(ManifestVersionError, match="newer than this build"):
+            TimeseriesCache(ParquetBackend(tmp_path / "cache")).read(**SERIES)

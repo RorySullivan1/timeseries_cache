@@ -36,6 +36,7 @@ from .errors import (
     IndexContractError,
     InvalidIdentityError,
     InvalidKwargError,
+    ManifestVersionError,
     OverlappingWriteError,
     SchemaForcedWarning,
     SchemaMismatchError,
@@ -64,6 +65,7 @@ __all__ = [
     "InvalidIdentityError",
     "InvalidKwargError",
     "Manifest",
+    "ManifestVersionError",
     "MemoryBackend",
     "OverlappingWriteError",
     "PandasReadResult",
@@ -99,7 +101,7 @@ def open_cache(
     ``staging_dir`` defaults to ``"auto"``: when ``root`` looks like a network
     or DFS share, files are built and flushed on local disk and only the
     finished bytes cross the wire. A local cache is unaffected. Pass a path to
-    pick the directory yourself, or ``None`` to always build beside the target.
+    pick the directory yourself, or ``None`` to always write in place.
 
     ``schema_policy`` decides how much latitude an incoming dtype gets against
     the one already stored — ``"lossless"`` (the default), ``"strict"``, or

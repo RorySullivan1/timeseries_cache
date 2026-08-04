@@ -16,7 +16,11 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Final
 
-from .errors import CacheKeyCollisionError, InvalidIdentityError
+from .errors import (
+    CacheKeyCollisionError,
+    InvalidIdentityError,
+    ManifestVersionError,
+)
 from .intervals import IntervalSet
 from .keys import CacheKey
 
@@ -145,7 +149,7 @@ class Manifest:
         payload = json.loads(raw)
         version = int(payload.get("format_version", 0))
         if version > FORMAT_VERSION:
-            raise ValueError(
+            raise ManifestVersionError(
                 f"manifest format_version {version} is newer than this build "
                 f"supports ({FORMAT_VERSION}); upgrade timeseries-cache"
             )

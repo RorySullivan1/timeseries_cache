@@ -207,7 +207,7 @@ The fsync is the part that matters most. A network redirector may refuse
 `os.fsync` outright — SMB and DFS both do on some servers, which surfaces as
 `Bad file descriptor` on an otherwise ordinary write. Building locally moves
 that call onto a filesystem that answers it, and the one flush that still
-happens on the share (of the copy about to be renamed) is best-effort for
+happens on the share (of the copy that has just landed) is best-effort for
 exactly that reason.
 
 One thing staging does *not* fix: reads still go to the share, and the
@@ -328,8 +328,8 @@ it once. Through the pandas facade `recast` takes pandas dtypes
 
 ## Durability
 
-Data and manifest are written to temp files and atomically renamed, ordered so
-an interrupted write always **under-claims**:
+Data and manifest are published as a new generation, never written over the
+live ones, so an interrupted write always **under-claims**.
 
 Data is written first and the manifest last, always. There is no second case:
 because a generation is published rather than mutated in place, a crash at any

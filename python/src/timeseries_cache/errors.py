@@ -45,6 +45,16 @@ class SchemaMismatchError(TimeseriesCacheError):
     """An incoming frame's schema disagrees with what the key already holds."""
 
 
+class ManifestVersionError(TimeseriesCacheError):
+    """A stored manifest was written by a newer build than this one.
+
+    Its own class because it is the one manifest failure that must *not* be
+    treated as "this generation is incomplete, fall back to the previous one".
+    Guessing at a layout this build does not understand is how a cache silently
+    serves wrong data.
+    """
+
+
 class UnknownKeyError(TimeseriesCacheError):
     """An operation needs a key that has never been written."""
 
