@@ -40,6 +40,19 @@ time and file size unchanged. Below ~16k the write cost starts climbing and wide
 reads get worse, so this is near the knee rather than as small as possible.
 """
 
+STAGING_SUBDIR: Final[str] = "timeseries_cache_staging"
+"""Directory under the system temp dir used when staging is chosen for you.
+
+A named subdirectory rather than the temp root, so a half-finished build after a
+hard kill is identifiable and sweepable rather than being one more anonymous
+``.tmp`` among everything else on the machine.
+"""
+
+DRIVE_REMOTE: Final[int] = 4
+"""``GetDriveTypeW`` result for a network drive. From winbase.h; hardcoded
+rather than pulled from pywin32, which the core deliberately does not depend on.
+"""
+
 DEFAULT_REPLACE_ATTEMPTS: Final[int] = 5
 DEFAULT_REPLACE_BACKOFF: Final[float] = 0.1
 """Retry budget for the final rename.
@@ -80,17 +93,22 @@ class ParquetBackend:
             ``replace_backoff``. Set to 1 to fail immediately.
         replace_backoff: Seconds before the second attempt, doubling thereafter.
             The default gives up after roughly 1.5s of trying.
-        staging_dir: Where to build a file before publishing it. ``None`` (the
-            default) builds it beside the target, which is right for a local
-            cache: the rename is then a same-volume metadata operation with
-            nothing to copy.
+        staging_dir: Where to build a file before publishing it.
 
-            Point it at local disk when ``root`` is a network or DFS share.
-            Parquet encoding and the fsync then happen on local storage, and
-            only the finished bytes cross the wire — as one streamed copy rather
-            than the many small writes encoding would otherwise push over SMB.
-            Publishing still lands a temp file beside the target and renames it
-            there, because a rename cannot cross volumes; see :meth:`_publish`.
+            ``"auto"`` (the default) stages on local disk when ``root`` looks
+            like a network or DFS share, and builds beside the target otherwise.
+            A local cache is therefore unaffected — its rename stays a
+            same-volume metadata operation with nothing to copy — while a share
+            gets the local build without anyone having to know to ask for it.
+
+            Staging is what keeps parquet encoding *and the fsync* off the wire.
+            Only the finished bytes cross, as one streamed copy rather than the
+            many small writes encoding would otherwise push over SMB. Publishing
+            still lands a temp beside the target and renames it there, because a
+            rename cannot cross volumes; see :meth:`_publish`.
+
+            Pass a path to choose the directory yourself (``r"C:\\temp"``), or
+            ``None`` to force building beside the target even on a share.
     """
 
     def __init__(
@@ -102,7 +120,7 @@ class ParquetBackend:
         fsync: bool = True,
         replace_attempts: int = DEFAULT_REPLACE_ATTEMPTS,
         replace_backoff: float = DEFAULT_REPLACE_BACKOFF,
-        staging_dir: str | os.PathLike[str] | None = None,
+        staging_dir: str | os.PathLike[str] | Literal["auto"] | None = "auto",
     ) -> None:
         if replace_attempts < 1:
             raise ValueError("replace_attempts must be at least 1")
@@ -112,7 +130,59 @@ class ParquetBackend:
         self.fsync = fsync
         self.replace_attempts = replace_attempts
         self.replace_backoff = replace_backoff
-        self.staging_dir = Path(staging_dir) if staging_dir is not None else None
+        self.staging_dir = self._resolve_staging_dir(staging_dir, self.root)
+
+    @classmethod
+    def _resolve_staging_dir(
+        cls,
+        staging_dir: str | os.PathLike[str] | Literal["auto"] | None,
+        root: Path,
+    ) -> Path | None:
+        """Turn the ``staging_dir`` argument into a directory, or ``None``.
+
+        ``"auto"`` is the only interesting case: stage locally exactly when the
+        root looks remote. Staging a *local* cache would be a pessimisation —
+        it turns a free same-volume rename into a full copy whenever the system
+        temp dir sits on a different volume from the cache.
+        """
+        if staging_dir == "auto":
+            if not cls._looks_remote(root):
+                return None
+            return Path(tempfile.gettempdir()) / STAGING_SUBDIR
+        return Path(staging_dir) if staging_dir is not None else None
+
+    @staticmethod
+    def _looks_remote(root: Path) -> bool:
+        """Whether ``root`` appears to live on a network or DFS share.
+
+        Two shapes on Windows, and both matter because callers use both: a UNC
+        path (``\\\\server\\share\\...``), and a mapped drive letter, which looks
+        local until you ask the OS. ``GetDriveTypeW`` is the ask, reached
+        through ``ctypes`` rather than pywin32 — this backend is meant to work
+        on a bare interpreter.
+
+        Deliberately conservative: anything it cannot classify is treated as
+        local, so the answer to an unexpected path shape is the behavior the
+        cache has always had rather than a surprise copy on every write.
+        """
+        if os.name != "nt":  # pragma: no cover - exercised on the Windows CI job
+            return False
+        try:
+            resolved = str(root.resolve())
+        except OSError:  # pragma: no cover - unreachable path, offline share
+            resolved = str(root)
+        if resolved.startswith("\\\\"):
+            return True
+        drive = os.path.splitdrive(resolved)[0]
+        if not drive:
+            return False
+        try:  # pragma: no cover - Windows-only
+            import ctypes
+
+            get_drive_type = ctypes.windll.kernel32.GetDriveTypeW  # type: ignore[attr-defined]
+            return bool(get_drive_type(f"{drive}\\") == DRIVE_REMOTE)
+        except Exception:  # pragma: no cover - defensive
+            return False
 
     def _dir(self, key: CacheKey) -> Path:
         return self.root / key.shard / key.digest
@@ -233,7 +303,22 @@ class ParquetBackend:
         try:
             produce(tmp_path)
             if fsync:
-                ParquetBackend._flush(tmp_path)
+                try:
+                    ParquetBackend._flush(tmp_path)
+                except OSError as error:
+                    # Strict, unlike the publish-side flush: this is where the
+                    # bytes are actually made durable. But say what to do about
+                    # it — a build directory that refuses fsync is a share, and
+                    # the fix is to build somewhere that doesn't.
+                    raise OSError(
+                        f"could not flush {tmp_path.name} in {build_dir}: "
+                        f"{error}. A filesystem that refuses fsync is almost "
+                        "always a network or DFS share; build on local disk "
+                        'instead (staging_dir=r"C:\\temp", or leave it "auto" '
+                        "to have a local directory chosen when the root looks "
+                        "remote), or pass fsync=False to give up the crash "
+                        "guarantee deliberately."
+                    ) from error
             ParquetBackend._publish(
                 tmp_path, target, attempts=attempts, backoff=backoff, fsync=fsync
             )
@@ -286,7 +371,18 @@ class ParquetBackend:
             # writes parquet encoding would otherwise push across the wire.
             shutil.copyfile(built, landed)
             if fsync:
-                ParquetBackend._flush(landed)
+                # Best-effort *here specifically*, unlike the build-side flush.
+                # This file is on the far side of the wire, and a network
+                # redirector is entitled to refuse fsync outright — SMB and DFS
+                # both do, with EBADF or EINVAL depending on the server. Failing
+                # the write over that would make a share unusable while losing
+                # nothing real: the bytes came from a source already flushed to
+                # local disk, and what makes the update atomic is the rename
+                # below, not this call. So a refusal costs crash-durability on
+                # the share — which the share never actually offered — rather
+                # than the write.
+                with contextlib.suppress(OSError):
+                    ParquetBackend._flush(landed)
             ParquetBackend._replace(landed, target, attempts=attempts, backoff=backoff)
         except BaseException:
             with contextlib.suppress(OSError):

@@ -231,11 +231,21 @@ Documented in `python/README.md` and deliberate — don't "fix" them without ask
   writers to the same key can lose an update. On a shared network drive that stops
   being hypothetical — say so rather than assuming a caller has read this far.
 - **Network/DFS shares are second-class.** The atomic rename needs the target to be
-  unheld and deletable, and a share gives you neither reliably. `staging_dir` moves
-  the build and the fsync onto local disk; `replace_attempts` rides out transient
-  holders (DFS Replication, indexers, antivirus); nothing rescues a share ACL'd
-  without delete rights, since a rename *is* a delete. Reads are unimproved by any
-  of it — a local `root` is still the better answer where it's an option.
+  unheld and deletable, and a share gives you neither reliably. `staging_dir`
+  (default `"auto"` — local temp when the root looks remote, beside the target
+  otherwise) moves the build *and the fsync* onto local disk; `replace_attempts`
+  rides out transient holders (DFS Replication, indexers, antivirus); nothing
+  rescues a share ACL'd without delete rights, since a rename *is* a delete. Reads
+  are unimproved by any of it — a local `root` is still the better answer where
+  it's an option.
+- **`os.fsync` is not available on every filesystem.** A network redirector may
+  refuse it outright (SMB/DFS return EBADF or EINVAL), so *where* a file is flushed
+  decides whether a write can succeed at all. Two flushes, two rules, and they must
+  not be conflated: the **build-side** flush is strict, because that is where
+  durability is established, and its error names `staging_dir`/`fsync=False`; the
+  **publish-side** flush of the copy landed on the share is `suppress`ed, because
+  its source was already durable locally and atomicity rests on the rename. Any new
+  fsync call site has to answer which of the two it is.
 - **Whole-key rewrite on write.** Reads scale (pushdown); writes scale with key size,
   not change size. The answer is more keys, not a rewrite of the storage model.
 - **A write never changes the stored schema.** Added or dropped columns are refused

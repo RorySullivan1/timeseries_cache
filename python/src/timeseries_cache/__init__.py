@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from .backends import MemoryBackend, ParquetBackend, StorageBackend
 from .core import (
@@ -92,13 +92,14 @@ def open_cache(
     identity_columns: Sequence[str] = (),
     schema_policy: SchemaPolicy | str = SchemaPolicy.LOSSLESS,
     conform_schema: bool | None = None,
-    staging_dir: str | os.PathLike[str] | None = None,
+    staging_dir: str | os.PathLike[str] | Literal["auto"] | None = "auto",
 ) -> TimeseriesCache:
     """Open a parquet-backed cache rooted at ``root``.
 
-    Pass ``staging_dir`` pointing at local disk when ``root`` is a network or
-    DFS share — files are then built and flushed locally, and only finished
-    bytes cross the wire.
+    ``staging_dir`` defaults to ``"auto"``: when ``root`` looks like a network
+    or DFS share, files are built and flushed on local disk and only the
+    finished bytes cross the wire. A local cache is unaffected. Pass a path to
+    pick the directory yourself, or ``None`` to always build beside the target.
 
     ``schema_policy`` decides how much latitude an incoming dtype gets against
     the one already stored — ``"lossless"`` (the default), ``"strict"``, or
@@ -123,7 +124,7 @@ def open_pandas_cache(
     identity_columns: Sequence[str] = (),
     schema_policy: SchemaPolicy | str = SchemaPolicy.LOSSLESS,
     conform_schema: bool | None = None,
-    staging_dir: str | os.PathLike[str] | None = None,
+    staging_dir: str | os.PathLike[str] | Literal["auto"] | None = "auto",
 ) -> PandasTimeseriesCache:
     """Open a parquet-backed cache with the pandas facade.
 

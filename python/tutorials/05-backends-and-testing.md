@@ -156,8 +156,10 @@ climbing and wide reads get worse.
 
 ## Caching onto a network or DFS share
 
-If `root` is a UNC path or mapped drive, build files locally and let only
-finished bytes cross the wire:
+If `root` is a UNC path or mapped drive this happens **automatically** — the
+backend detects a remote root and builds under the system temp dir, so parquet
+encoding and the fsync stay off the wire. The explicit form, for choosing the
+directory yourself or for simulating the shape in a test:
 
 ```python
 networked = TimeseriesCache(
@@ -178,6 +180,13 @@ finished file to a temp *beside* the target and renames it there — two steps,
 because **a rename cannot cross volumes** (`os.replace` raises `EXDEV` rather
 than silently copying). The rename within the share is still atomic, so a reader
 never sees a partial file.
+
+The fsync is the part that matters most. A network redirector may refuse
+`os.fsync` outright — SMB and DFS both do on some servers, which surfaces as
+`Bad file descriptor` on an otherwise ordinary write. Building locally moves
+that call onto a filesystem that answers it, and the one flush that still
+happens on the share (of the copy about to be renamed) is best-effort for
+exactly that reason.
 
 Two things staging does *not* fix: reads still go to the share, and on Windows
 the final rename can be refused while anything holds the target open — DFS

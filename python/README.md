@@ -281,17 +281,30 @@ below.
 
 ## Network and DFS shares
 
-If `root` is a UNC path or a mapped network drive, **stage locally**:
+If `root` is a UNC path or a mapped network drive, the cache **stages the build
+on local disk automatically** — nothing to configure:
 
 ```python
-cache = open_cache(
-    r"\\server\share\cache", staging_dir=r"C:\Users\me\AppData\Local\tscache"
-)
+cache = open_cache(r"\\server\share\cache")  # staged under the system temp dir
 ```
 
 Parquet encoding and the fsync then happen on local disk, and only finished
 bytes cross the wire — as one streamed copy rather than the many small writes
 encoding otherwise pushes over SMB.
+
+**The fsync is the part that matters.** A network redirector is entitled to
+refuse `os.fsync` outright, and SMB and DFS both do on some servers — which
+turns an ordinary write into `OSError: [Errno 9] Bad file descriptor`. Building
+locally moves that call onto a filesystem that answers it.
+
+Detection is Windows-only and conservative: a UNC path, or a drive letter that
+`GetDriveTypeW` reports as remote. Anything it can't classify is treated as
+local, so a local cache keeps its free same-volume rename. Override either way:
+
+```python
+open_cache(share, staging_dir=r"C:\temp")  # choose the directory yourself
+open_cache(share, staging_dir=None)  # always build beside the target
+```
 
 Publishing still takes two steps, because **a rename cannot cross volumes**:
 `os.replace` raises `EXDEV` rather than silently copying. So the finished file is
@@ -329,6 +342,18 @@ the usual causes are:
   change can work around this; the directory needs Modify.
 - **Another writer.** See the single-writer limitation below. On a shared drive
   that stops being hypothetical.
+
+### Durability on a share is best-effort, by necessity
+
+The copy that lands beside the target is fsync'd where the share allows it and
+**not** where it refuses — a refusal there costs crash-durability the share
+never really offered, and failing the write over it would make a share unusable
+for nothing. What makes the update atomic is the rename, not that call, and the
+bytes were already flushed on local disk before crossing.
+
+The build-side fsync is the opposite: strict, because that is where the data is
+actually made durable. If it fails, the error names `staging_dir` and
+`fsync=False` rather than leaving you with a bare `Bad file descriptor`.
 
 **Staging fixes the write path, not the read path.** Reads still go straight to
 the share, and the row-group skipping the cache is tuned around gives back much
